@@ -2,7 +2,8 @@
 """Relay inference-only provider. Python 3.10+. Starts and owns its llama-server.
 No shell, document URL fetch, arbitrary tool execution, or remote model download.
 """
-import argparse, concurrent.futures, hashlib, json, os, signal, socket, subprocess, sys, time
+import argparse, concurrent.futures, hashlib, json, os, signal, socket, subprocess, sys, threading, time
+from http.client import IncompleteRead
 from pathlib import Path
 from urllib.request import Request, build_opener, HTTPRedirectHandler, ProxyHandler
 from urllib.error import HTTPError, URLError
@@ -20,6 +21,7 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 OPENER = build_opener(NoRedirect(), ProxyHandler({}))
+TRANSPORT_ERRORS = (URLError, TimeoutError, ConnectionError, IncompleteRead)
 
 def request_json(url, payload=None, token=None, timeout=12):
     headers = {"Content-Type": "application/json"}
@@ -27,7 +29,14 @@ def request_json(url, payload=None, token=None, timeout=12):
         headers["Authorization"] = "Bearer " + token
     req = Request(url, data=None if payload is None else json.dumps(payload).encode(), headers=headers)
     with OPENER.open(req, timeout=timeout) as response:
-        return json.loads(response.read(1000000))
+        body = response.read(1000001)
+        if len(body) > 1000000:
+            raise ValueError("HTTP response exceeds the size limit.")
+        # A sized HTTPResponse.read() can return a truncated Content-Length body
+        # without raising IncompleteRead. Preserve its transport-error meaning.
+        if response.length:
+            raise IncompleteRead(body, response.length)
+        return json.loads(body)
 
 class Provider:
     def __init__(self, args):
@@ -39,23 +48,95 @@ class Provider:
         self.stop = False
         self.token = os.environ.get("RELAY_NODE_TOKEN", "")
         self.lease = None
+        self._initialize_guards()
+
+    def _initialize_guards(self):
+        self._runtime_lock = threading.RLock()
+        self._lease_lock = threading.RLock()
+        self._lease_timer = None
+        self._lease_generation = 0
+        self._lease_expired = False
+
+    def _check_lease(self):
+        if self._lease_expired or (self.lease is not None and time.monotonic() >= self.lease):
+            raise RuntimeError("Lease renewal not confirmed; reclaiming GPU.")
+
+    def _set_lease(self, deadline):
+        with self._lease_lock:
+            # A late renewal must never revive a grant that the watchdog stopped.
+            self._check_lease()
+            if self.stop or deadline <= time.monotonic():
+                raise RuntimeError("Lease renewal arrived after its execution deadline.")
+            if self._lease_timer:
+                self._lease_timer.cancel()
+            self.lease = deadline
+            self._lease_generation += 1
+            self._arm_watchdog(self._lease_generation)
+
+    def _renew_task(self, task):
+        renewal = self.api("poll", {**self.contract,
+            "attemptId":task["lease"]["attemptId"], "epoch":task["lease"]["epoch"]})
+        if renewal.get("paused"):
+            raise RuntimeError("Owner paused this provider.")
+        self._set_lease(self.last_poll_started + max(0, min(25, renewal.get("leaseRemainingMs", 0)/1000 - 2)))
+
+    def _arm_watchdog(self, generation):
+        self._lease_timer = threading.Timer(max(0, self.lease - time.monotonic()),
+                                            self._expire_lease, args=(generation,))
+        self._lease_timer.daemon = True
+        self._lease_timer.start()
+
+    def _expire_lease(self, generation):
+        with self._lease_lock:
+            if generation != self._lease_generation or self.lease is None:
+                return
+            if time.monotonic() < self.lease:
+                self._arm_watchdog(generation)
+                return
+            self._lease_expired = True
+            # A socket timeout measures inactivity, not total response duration.
+            # Keep this independent of HTTP reads, including slowly trickled data.
+            # Holding the lease lock prevents this old timer killing a new grant.
+            self.stop_runtime()
+
+    def _clear_lease(self):
+        with self._lease_lock:
+            if self._lease_timer:
+                self._lease_timer.cancel()
+            self._lease_timer = None
+            self._lease_generation += 1
+            self.lease = None
+            self._lease_expired = False
+
+    def _sleep(self, seconds):
+        if self.lease is not None:
+            seconds = min(seconds, max(0, self.lease - time.monotonic()))
+        time.sleep(seconds)
 
     def api(self, action, payload):
+        timeout = 12
+        if action != "release" and self.lease is not None:
+            self._check_lease()
+            timeout = min(timeout, self.lease - time.monotonic())
+            if timeout <= 0:
+                raise RuntimeError("Lease renewal not confirmed; reclaiming GPU.")
         if action == "poll":
             self.last_poll_started = time.monotonic()
         return request_json(self.args.coordinator.rstrip("/") + "/api/provider",
                             {"poolId": self.args.pool, "nodeId": self.args.node, "action": action,
-                             "payload": payload}, self.token)["result"]
+                             "payload": payload}, self.token, timeout=timeout)["result"]
 
     def stop_runtime(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-        self.process = None
+        # The watchdog, main loop and signal handler may all request cleanup.
+        with self._runtime_lock:
+            if self.process and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=5)
+            self.process = None
 
     def start_runtime(self):
         if self.process and self.process.poll() is None:
@@ -69,7 +150,7 @@ class Provider:
              "--ctx-size", str(self.args.context), "--parallel", "1", "--host", "127.0.0.1",
              "--port", str(self.args.port), "-ngl", str(self.args.gpu_layers), "--no-context-shift"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False,
-            env={k:v for k,v in os.environ.items() if k in {"PATH","SystemRoot","WINDIR","TEMP","TMP","LANG","LC_ALL","LD_LIBRARY_PATH","CUDA_VISIBLE_DEVICES","CUDA_DEVICE_ORDER"}})
+            env={k:v for k,v in os.environ.items() if k.upper() in {"PATH","SYSTEMROOT","WINDIR","TEMP","TMP","LANG","LC_ALL","LD_LIBRARY_PATH","CUDA_VISIBLE_DEVICES","CUDA_DEVICE_ORDER"}})
         until = time.monotonic() + 120
         while time.monotonic() < until and not self.stop:
             if self.process.poll() is not None:
@@ -84,7 +165,7 @@ class Provider:
                 if context != self.args.context or props.get("total_slots") != 1:
                     raise RuntimeError("The active context/slot configuration does not match the contract.")
                 return
-            except (URLError, TimeoutError):
+            except TRANSPORT_ERRORS:
                 time.sleep(1)
         raise RuntimeError("Runtime startup timed out or stopped.")
 
@@ -125,10 +206,20 @@ class Provider:
         future = None
         task = None
         payload = None
+        draining = None
         try:
             while not self.stop:
+                # A stopped runtime may still have an inference thread unwinding.
+                # Do not let that old thread access a newly started runtime, or
+                # queue another grant behind it in this single-worker executor.
+                if draining is not None:
+                    if not draining.done():
+                        time.sleep(1)
+                        continue
+                    draining = None
                 try:
                     if future:
+                        self._check_lease()
                         if future.done():
                             if payload is None:
                                 payload = future.result()
@@ -136,17 +227,11 @@ class Provider:
                             result = self.api("submit", payload)
                             print("Settled receipt:", result["receipt"], flush=True)
                             future = task = payload = None
-                            self.lease = None
+                            self._clear_lease()
                             if self.args.once:
                                 return
                         else:
-                            if time.monotonic() >= self.lease:
-                                raise RuntimeError("Lease renewal not confirmed; reclaiming GPU.")
-                            renewal = self.api("poll", {**self.contract,
-                                "attemptId":task["lease"]["attemptId"], "epoch":task["lease"]["epoch"]})
-                            if renewal.get("paused"):
-                                raise RuntimeError("Owner paused this provider.")
-                            self.lease = self.last_poll_started + max(0, min(25, renewal.get("leaseRemainingMs", 0)/1000 - 2))
+                            self._renew_task(task)
                     else:
                         if self.process is None:
                             status = self.api("status", {})
@@ -161,14 +246,16 @@ class Provider:
                             continue
                         task = response.get("task")
                         if task:
-                            self.lease = self.last_poll_started + 25
+                            # A claim can return an existing, nearly expired grant.
+                            # Confirm its fenced renewal before starting any inference.
+                            self._renew_task(task)
                             future = executor.submit(self.infer, task)
                             print("Running assigned document", task["taskId"], flush=True)
-                    time.sleep(3)
-                except (HTTPError, URLError, TimeoutError, RuntimeError, KeyError, ValueError) as exc:
+                    self._sleep(3)
+                except (*TRANSPORT_ERRORS, RuntimeError, KeyError, ValueError) as exc:
                     # Credentials, expired grants and inference failures fail closed.
-                    if isinstance(exc, (URLError, TimeoutError)) and not isinstance(exc, HTTPError) and future and self.lease and time.monotonic() < self.lease:
-                        time.sleep(2)
+                    if isinstance(exc, TRANSPORT_ERRORS) and not isinstance(exc, HTTPError) and future and self.lease and not self._lease_expired and time.monotonic() < self.lease:
+                        self._sleep(2)
                         continue
                     print("Provider recovery:", type(exc).__name__, flush=True)
                     self.stop_runtime()
@@ -179,10 +266,13 @@ class Provider:
                         except Exception:
                             pass
                     if future:
+                        future.cancel()
                         try: future.result(timeout=7)
                         except Exception: pass
+                        if not future.done():
+                            draining = future
                     future = task = payload = None
-                    self.lease = None
+                    self._clear_lease()
                     if isinstance(exc, HTTPError) and exc.code in (401,403):
                         raise RuntimeError("Provider key is invalid or revoked.") from None
                     if self.args.once:
@@ -190,6 +280,7 @@ class Provider:
                     time.sleep(5)
         finally:
             self.stop_runtime()
+            self._clear_lease()
             executor.shutdown(wait=True, cancel_futures=True)
 
 def main():

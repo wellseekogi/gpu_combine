@@ -1,0 +1,9 @@
+provider/*.py text eol=lf
+provider/*.json text eol=lf
+tests/*_test.py text eol=lf
+tests/provider-package.test.mjs text eol=lf
+standalone/provider-archive.mjs text eol=lf
+scripts/package-provider.mjs text eol=lf
+.github/workflows/provider-release.yml text eol=lf
+docs/provider-auto-update-ko.md text eol=lf
+START-PROVIDER.cmd text eol=crlf

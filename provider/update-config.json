@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "repository": "wellseekogi/gpu_combine",
+  "release_tag_prefix": "provider-v",
+  "manifest_asset": "relay-provider-manifest.json",
+  "archive_asset": "relay-provider.zip"
+}

@@ -162,3 +162,11 @@ HTTP·제공자 테스트의 추론 응답은 synthetic fixture입니다. 실물
 ## 디자인과 검증 기록
 
 시스템 밝기 설정에 따른 라이트·다크 모드, 작은 화면의 작업 목록, 확대 글자 재배치, 키보드 포커스를 적용했습니다. 변경 근거·색 대비·브라우저 검사 결과는 [디자인 검토](docs/design-review-ko.md), 설계 개선은 [아키텍처 검토](docs/architecture-review-ko.md)에 정리했습니다.
+
+## 참여자 프로그램 자동 업데이트
+
+처음 한 번 [GitHub 참여자 배포 ZIP](https://github.com/wellseekogi/gpu_combine/releases/latest/download/relay-provider.zip)을 모두 압축 해제하고 `START-PROVIDER.cmd`를 실행합니다. 이후에는 같은 실행기가 최신 정식 버전을 비교하고, ZIP과 포함 파일의 SHA-256 검증 후 새 버전을 실행합니다. 공개 저장소이므로 GitHub 로그인은 필요하지 않습니다. 기존 모델·연결 파일·설정은 유지합니다.
+
+실행 중인 참여 작업은 자동으로 중단하지 않습니다. 새 버전은 설정 창을 닫고 다시 실행할 때 적용됩니다. 네트워크나 업데이트 검증에 문제가 있으면 검증된 기존 버전을 사용합니다. 개발 소스에서 직접 실행할 때는 편집 중인 로컬 코드를 사용합니다.
+
+배포자는 `provider/version.json`의 버전을 올리고 같은 버전의 `provider-v` 태그를 push하면 됩니다. 테스트·패키징·GitHub Release 게시는 자동으로 진행됩니다. [설치·검증·배포 절차](docs/provider-auto-update-ko.md)를 참고하세요.

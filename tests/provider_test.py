@@ -42,6 +42,32 @@ class ProviderContractTests(unittest.TestCase):
         self.p.process=process;self.p.stop_runtime()
         process.terminate.assert_called_once();process.wait.assert_called_once_with(timeout=5)
         self.assertIsNone(self.p.process)
+    def test_concurrent_reclaim_terminates_the_owned_process_once(self):
+        import threading
+        from unittest.mock import Mock
+        entered = threading.Event()
+        finish = threading.Event()
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = lambda **_: (entered.set(), finish.wait(2))
+        self.p.process = process
+        threads = [threading.Thread(target=self.p.stop_runtime) for _ in range(2)]
+        try:
+            threads[0].start()
+            self.assertTrue(entered.wait(1))
+            threads[1].start()
+            finish.set()
+            for thread in threads:
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once_with(timeout=5)
+            self.assertIsNone(self.p.process)
+        finally:
+            finish.set()
+            for thread in threads:
+                if thread.ident:
+                    thread.join(timeout=2)
     def test_local_file_fingerprints_are_exact(self):
         expected=hashlib.sha256(b"approved template").hexdigest()
         self.assertEqual(self.p.contract["template"],expected)
@@ -76,6 +102,7 @@ class ProviderSafetyTests(unittest.TestCase):
         from unittest.mock import Mock
         p=module.Provider.__new__(module.Provider)
         p.args=SimpleNamespace(once=False);p.token="test";p.stop=False;p.process=None;p.contract={};p.lease=None
+        p._initialize_guards()
         p.api=Mock(return_value={"paused":True});p.start_runtime=Mock();p.stop_runtime=Mock()
         polls=[]
         def sleep(seconds):
@@ -91,10 +118,10 @@ class ProviderSafetyTests(unittest.TestCase):
         p.process=None;p.stop=False;p.base="http://127.0.0.1:8081"
         template="approved";p.contract={"template":hashlib.sha256(template.encode()).hexdigest()}
         process=Mock();process.poll.return_value=None
-        with patch.object(module.os,"environ",{"PATH":"test","RELAY_NODE_TOKEN":"never-forward","LLAMA_ARG_MODEL":"wrong","OPENAI_API_KEY":"never-forward"}):
+        with patch.object(module.os,"environ",{"PATH":"test","SYSTEMROOT":"C:/Windows","WINDIR":"C:/Windows","RELAY_NODE_TOKEN":"never-forward","LLAMA_ARG_MODEL":"wrong","OPENAI_API_KEY":"never-forward"}):
             with patch.object(module.socket,"socket"),patch.object(module.subprocess,"Popen",return_value=process) as popen:
                 with patch.object(module,"request_json",side_effect=[{},{"default_generation_settings":{"n_ctx":8192},"total_slots":1,"chat_template":template}]):
                     p.start_runtime()
-        self.assertEqual(popen.call_args.kwargs["env"],{"PATH":"test"})
+        self.assertEqual(popen.call_args.kwargs["env"],{"PATH":"test","SYSTEMROOT":"C:/Windows","WINDIR":"C:/Windows"})
         self.assertFalse(popen.call_args.kwargs["shell"])
 
