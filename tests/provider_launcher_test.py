@@ -46,7 +46,7 @@ class ProviderLauncherTests(unittest.TestCase):
     def test_success_preserves_working_directory_and_path_argument(self):
         argument = str(self.directory / "connection with spaces.json")
         source = ("from pathlib import Path\nimport sys\n"
-                  "assert Path.cwd() == Path(__file__).resolve().parents[1]\n"
+                  "assert Path.cwd().resolve() == Path(__file__).resolve().parents[1]\n"
                   "assert sys.argv[1] == " + repr(argument) + "\n"
                   "print('SETUP_COMPLETED')\n")
         result = self.run_launcher(source, argument)

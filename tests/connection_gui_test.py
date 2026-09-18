@@ -159,7 +159,8 @@ class ConnectionGUITests(unittest.TestCase):
     def assert_preferences_contain_only_paths(self, expected_path, token):
         saved = self.preferences.read_text(encoding="utf-8")
         payload = json.loads(saved)
-        self.assertEqual(payload["connection_file"], str(expected_path.resolve()))
+        # Windows runner temp paths can use either long or DOS 8.3 names.
+        self.assertEqual(Path(payload["connection_file"]).resolve(), expected_path.resolve())
         self.assertLessEqual(set(payload), {"version", *setup.PREFERENCE_PATHS})
         self.assertNotIn(token, saved)
         self.assertNotIn('"token"', saved)
