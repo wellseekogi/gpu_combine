@@ -1,1 +1,21 @@
-import {defineConfig} from "vite";import react from "@vitejs/plugin-react";import {fileURLToPath} from "node:url";export default defineConfig({root:fileURLToPath(new URL(".",import.meta.url)),publicDir:"../public",plugins:[react()],resolve:{alias:{"@":fileURLToPath(new URL("..",import.meta.url))}},build:{outDir:"../standalone-dist",emptyOutDir:true}});
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import { fileURLToPath } from "node:url";
+
+const target = `http://127.0.0.1:${process.env.RELAY_PORT ?? 8788}`;
+export default defineConfig({
+  root: fileURLToPath(new URL(".", import.meta.url)),
+  publicDir: "../public",
+  plugins: [react()],
+  resolve: { alias: { "@": fileURLToPath(new URL("..", import.meta.url)) } },
+  server: {
+    host: "127.0.0.1",
+    port: 5173,
+    strictPort: true,
+    proxy: {
+      "/api": { target, changeOrigin: false },
+
+    },
+  },
+  build: { outDir: "../standalone-dist", emptyOutDir: true },
+});
