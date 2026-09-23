@@ -315,7 +315,48 @@ class UpdateLauncherTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(module.UpdateError):
                 handler.redirect_request(request, None, 302, "Found", {}, url)
 
-    def test_credentials_retry_is_optional_in_memory_and_never_logged(self):
+    def test_public_http_errors_never_discover_credentials_and_use_verified_fallback(self):
+        class PublicEnvironment(dict):
+            def __getitem__(self, name):
+                if name in {"GH_TOKEN", "GITHUB_TOKEN"}:
+                    raise AssertionError("Public updates must not read GitHub credentials")
+                return super().__getitem__(name)
+
+            def get(self, name, default=None):
+                if name in {"GH_TOKEN", "GITHUB_TOKEN"}:
+                    raise AssertionError("Public updates must not read GitHub credentials")
+                return super().get(name, default)
+
+        environment = PublicEnvironment({**os.environ, "GH_TOKEN": "private-gh-token",
+                                         "GITHUB_TOKEN": "private-github-token"})
+        for fallback in ("bundled", "cache"):
+            if fallback == "cache":
+                fetch, _, _ = self.network()
+                self.update(fetch=fetch)
+            for code in (401, 403, 404):
+                for failed_request in range(3):
+                    with self.subTest(fallback=fallback, code=code, failed_request=failed_request):
+                        actual, _, _ = self.network(version="0.5.0")
+                        attempts = []
+
+                        def denied(url, **kwargs):
+                            attempts.append(kwargs["token"])
+                            if len(attempts) == failed_request + 1:
+                                raise HTTPError(url, code, "private response detail", {}, None)
+                            return actual(url, **kwargs)
+
+                        with patch.object(module.os, "environ", environment), \
+                                patch.object(module.subprocess, "run") as run:
+                            result = self.update(fetch=denied)
+                        run.assert_not_called()
+                        self.assertEqual(attempts, [None] * (failed_request + 1))
+                        self.assertFalse(result["updated"])
+                        self.assertEqual(result["source"], fallback)
+                        self.assertEqual(result["version"], "0.4.0" if fallback == "cache" else "0.3.0")
+                        self.assertIn("HTTP " + str(code), " ".join(result["warnings"]))
+                        self.assertNotIn("private", json.dumps(result))
+
+    def test_explicit_internal_token_is_in_memory_and_never_logged(self):
         actual, calls, _ = self.network()
         attempts = []
 
@@ -325,15 +366,11 @@ class UpdateLauncherTests(unittest.TestCase):
                 raise HTTPError(url, 404, "missing", {}, None)
             return actual(url, **kwargs)
 
-        with patch.object(module, "_optional_token", return_value="sensitive-token"):
-            result = self.update(fetch=private)
+        result = self.update(fetch=private, token="sensitive-token")
         self.assertTrue(result["updated"])
-        self.assertEqual(attempts, [None, "sensitive-token", "sensitive-token", "sensitive-token"])
+        self.assertEqual(attempts, ["sensitive-token", "sensitive-token", "sensitive-token"])
         self.assertNotIn("sensitive-token", json.dumps(result))
         self.assertNotIn(b"sensitive-token", (self.cache / "current.json").read_bytes())
-        with patch.dict(os.environ, {"GH_TOKEN": "from-env"}, clear=True), patch.object(module.subprocess, "run") as run:
-            self.assertEqual(module._optional_token(), "from-env")
-            run.assert_not_called()
 
     def test_fetch_only_sends_token_to_api_and_bounds_response(self):
         requests = []
@@ -393,6 +430,56 @@ class UpdateLauncherTests(unittest.TestCase):
         with module._update_lock(self.cache, timeout=0.1):
             pass
 
+    def write_service_origin(self, origin):
+        path = self.bundle / "provider/service-config.json"
+        path.write_bytes(encoded({"coordinator": origin}))
+        manifest_path = self.bundle / "provider-manifest.json"
+        manifest = json.loads(manifest_path.read_bytes())
+        manifest["files"]["provider/service-config.json"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        manifest_path.write_bytes(encoded(manifest))
+
+    def test_download_origin_survives_cached_bootstrap_and_gui_handoff(self):
+        origin = "https://relay.example.org"
+        self.write_service_origin(origin)
+        cached = self.root / "cached"
+        result = {"root": str(cached), "version": "0.4.0", "source": "cache", "updated": False, "warnings": []}
+        calls = []
+
+        def launch(arguments, *, env):
+            calls.append((arguments, env.get("RELAY_SERVICE_ORIGIN")))
+            if arguments[1].endswith("update_launcher.py"):
+                with patch.object(module, "__file__", str(cached / "provider/update_launcher.py")), patch.dict(module.os.environ, env, clear=True):
+                    return module.main(arguments[2:])
+            return 0
+
+        with patch.dict(module.os.environ, {}, clear=True), \
+                patch.object(module, "__file__", str(self.bundle / "provider/update_launcher.py")), \
+                patch.object(module, "update_and_select", return_value=result), \
+                patch.object(module.subprocess, "call", side_effect=launch):
+            self.assertEqual(module.main([]), 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([origin_value for _, origin_value in calls], [origin, origin])
+        self.assertTrue(calls[-1][0][1].endswith("setup_gui.py"))
+        self.assertFalse((cached / "provider/service-config.json").exists(), "shared immutable cache must not be changed")
+
+    def test_service_origin_is_bounded_validated_and_verified(self):
+        with patch.dict(module.os.environ, {}, clear=True):
+            for origin in ["https://relay.example.org", "http://127.0.0.1:8788", "http://[::1]:8788"]:
+                self.write_service_origin(origin)
+                self.assertEqual(module._service_environment(self.bundle)["RELAY_SERVICE_ORIGIN"], origin)
+            for origin in [None, 7, "", "http://remote.example", "https://user:secret@relay.example", "https://relay.example/path", "https://relay.example?token=secret", "https://relay.example#fragment", "https://relay.example:bad", "https://relay.example\n"]:
+                self.write_service_origin(origin)
+                self.assertNotIn("RELAY_SERVICE_ORIGIN", module._service_environment(self.bundle))
+            self.write_service_origin("https://relay.example.org")
+            (self.bundle / "provider/service-config.json").write_bytes(encoded({"coordinator": "https://changed.example"}))
+            self.assertNotIn("RELAY_SERVICE_ORIGIN", module._service_environment(self.bundle))
+            (self.bundle / "provider/service-config.json").write_bytes(b" " * 65537)
+            self.assertNotIn("RELAY_SERVICE_ORIGIN", module._service_environment(self.bundle))
+        with patch.dict(module.os.environ, {"RELAY_SERVICE_ORIGIN": "https://inherited.example"}):
+            self.assertEqual(module._service_environment(self.bundle)["RELAY_SERVICE_ORIGIN"], "https://inherited.example")
+        with patch.dict(module.os.environ, {"RELAY_SERVICE_ORIGIN": "https://user:secret@invalid.example"}):
+            self.assertNotIn("RELAY_SERVICE_ORIGIN", module._service_environment(self.bundle))
+
     def test_check_only_never_launches_gui_and_preserves_gui_arguments(self):
         result = {"root": str(self.bundle), "version": "0.3.0", "source": "bundled", "updated": False, "warnings": []}
         with patch.object(module, "update_and_select", return_value=result), patch.object(module.subprocess, "call") as call, patch("sys.stdout", new=io.StringIO()):
@@ -415,10 +502,10 @@ class UpdateLauncherTests(unittest.TestCase):
         result = {"root": str(cached), "version": "0.4.0", "source": "cache", "updated": False, "warnings": []}
         calls = []
 
-        def launch(arguments):
+        def launch(arguments, *, env):
             calls.append(arguments)
             if arguments[1].endswith("update_launcher.py"):
-                with patch.object(module, "__file__", str(cached / "provider/update_launcher.py")):
+                with patch.object(module, "__file__", str(cached / "provider/update_launcher.py")), patch.dict(module.os.environ, env, clear=True):
                     return module.main(arguments[2:])
             return 0
 

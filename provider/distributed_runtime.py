@@ -12,15 +12,19 @@ import ipaddress
 import json
 import math
 import os
+import queue
 import re
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 
 if __package__:
     from .provider import digest_file, request_json
@@ -108,6 +112,7 @@ def load_group(args):
     if sum(stage_layers) != layers:
         raise ValueError("Group GPU stages must assign every model layer exactly once.")
     args.gpu_count = len(gpus)
+    args.group_gpu_ids = [gpu.get("id") for gpu in gpus]
     # b10964 llama-model.cpp includes the output head in the all-offloaded split.
     # Integer stage counts give the same float boundary as il / (layers + 1).
     stage_layers[-1] += 1
@@ -165,12 +170,43 @@ def validate(args):
         raise ValueError("--trusted-private-network is required: RPC peers must be isolated and trusted.")
     if args.role == "server":
         load_group(args)
+    if args.coordinator:
+        try:
+            address = urlsplit(args.coordinator)
+            port = address.port
+        except ValueError:
+            raise ValueError("Use a valid coordinator HTTPS origin.") from None
+        if (not address.hostname or address.username or address.password or address.query or address.fragment
+                or address.path not in ("", "/") or port == 0 or "\\" in args.coordinator
+                or any(ord(char) < 33 for char in args.coordinator)
+                or not (address.scheme == "https" or (address.scheme == "http"
+                        and address.hostname in ("127.0.0.1", "localhost", "::1")))):
+            raise ValueError("Coordinator must be an HTTPS origin; only loopback permits HTTP.")
+        token = os.environ.get("RELAY_INFERENCE_PROVIDER_TOKEN", "")
+        if not 32 <= len(token) <= 256 or any(ord(char) < 33 or ord(char) > 126 for char in token):
+            raise ValueError("Set RELAY_INFERENCE_PROVIDER_TOKEN to the configured GPU provider key (32..256 ASCII characters).")
+        if (not args.group or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}", args.group)
+                or not args.gpu_id or len(args.gpu_id) > 16 or len(set(args.gpu_id)) != len(args.gpu_id)
+                or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}", item) for item in args.gpu_id)):
+            raise ValueError("Coordinator reporting requires --group and unique --gpu-id identifiers from its configuration.")
+        args.coordinator = args.coordinator.rstrip("/")
+    elif args.gpu_id:
+        raise ValueError("--gpu-id requires --coordinator.")
     if not 1 <= args.port <= 65535 or not math.isfinite(args.startup_timeout) or args.startup_timeout <= 0:
         raise ValueError("Use port 1..65535 and a finite, positive startup timeout.")
     devices = args.device.split(",")
     if (not devices or len(set(devices)) != len(devices)
             or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:-]*", device) for device in devices)):
         raise ValueError("--device requires unique device names from llama-server --list-devices.")
+    if args.coordinator:
+        local_devices = [device for device in devices if not re.fullmatch(r"RPC\d+", device)]
+        if len(args.gpu_id) != len(local_devices):
+            raise ValueError("Use one --gpu-id per local device, excluding remote RPC devices.")
+        if args.role == "server":
+            local_ids = [gpu_id for gpu_id, device in zip(args.group_gpu_ids, devices)
+                         if not re.fullmatch(r"RPC\d+", device)]
+            if set(args.gpu_id) != set(local_ids):
+                raise ValueError("--gpu-id must identify this server's local devices in group.gpus order.")
     if args.role == "rpc":
         args.bind = private_ipv4(args.bind)
         if any(re.fullmatch(r"RPC\d+", device) for device in devices):
@@ -208,6 +244,34 @@ class DistributedRuntime:
         self.process = None
         self.stopping = False
         self.slot_directory = None
+        self.state = "starting"
+        self.runtime_id = uuid.uuid4().hex
+        self.started_at = int(time.time() * 1000)
+        self._runtime_lock = threading.RLock()
+        self._notifications = queue.Queue()
+        self._notifier = None
+        if self.args.coordinator:
+            self._notifier = threading.Thread(target=self._notify, daemon=True)
+            self._notifier.start()
+
+    def _notify(self):
+        while (payload := self._notifications.get()) is not None:
+            try:
+                request_json(self.args.coordinator + "/api/inference/provider", payload,
+                             os.environ.get("RELAY_INFERENCE_PROVIDER_TOKEN", ""), timeout=2)
+            except Exception:
+                # The gateway also detects failed upstreams; never wait for it to free local GPUs.
+                print("GPU state notification failed; local reclaim continues independently.", file=sys.stderr, flush=True)
+
+    def _state(self, state):
+        if self.state == state:
+            return
+        self.state = state
+        payload = {"groupId": self.args.group, "gpuIds": self.args.gpu_id, "state": state,
+                   "runtimeId": self.runtime_id, "startedAt": self.started_at}
+        print("RELAY_GPU " + json.dumps(payload), flush=True)
+        if self._notifier:
+            self._notifications.put(payload)
 
     def command(self):
         a = self.args
@@ -225,20 +289,25 @@ class DistributedRuntime:
 
     def request_stop(self, *_):
         self.stopping = True
+        self.stop_runtime()
 
     def stop_runtime(self):
-        if self.process is not None:
-            if self.process.poll() is None:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
-            self.process = None
-        if self.slot_directory is not None:
-            self.slot_directory.cleanup()
-            self.slot_directory = None
+        with self._runtime_lock:
+            if self.process is not None:
+                self._state("reclaiming")
+                if self.process.poll() is None:
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=5)
+                self.process = None
+            # Only the owned process exiting confirms return, never a stop request or an HTTP ACK.
+            self._state("released")
+            if self.slot_directory is not None:
+                self.slot_directory.cleanup()
+                self.slot_directory = None
 
     def check_server_contract(self):
         a = self.args
@@ -254,23 +323,28 @@ class DistributedRuntime:
             raise RuntimeError("Active model/template/alias/slots/context differs from the approved contract.")
 
     def start(self):
-        if self.process is not None or self.stopping:
+        if self.process is not None:
             raise RuntimeError("This launcher starts one owned process once.")
         a = self.args
         host = a.bind if a.role == "rpc" else "127.0.0.1"
         try:
-            # Never attach to a pre-existing service. This host must be trusted.
-            with socket.socket() as probe:
-                probe.bind((host, a.port))
-            if a.role == "server":
-                self.slot_directory = tempfile.TemporaryDirectory(prefix="relay-kv-slots-")
-            self.process = subprocess.Popen(
-                self.command(), shell=False, stdin=subprocess.DEVNULL,
-                env={key: value for key, value in os.environ.items() if key.upper() in CHILD_ENV},
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            with self._runtime_lock:
+                if self.stopping:
+                    return
+                # Never attach to a pre-existing service. This host must be trusted.
+                with socket.socket() as probe:
+                    probe.bind((host, a.port))
+                if a.role == "server":
+                    self.slot_directory = tempfile.TemporaryDirectory(prefix="relay-kv-slots-")
+                self.process = subprocess.Popen(
+                    self.command(), shell=False, stdin=subprocess.DEVNULL,
+                    env={key: value for key, value in os.environ.items() if key.upper() in CHILD_ENV},
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                process = self.process
+                self._state("providing")
             deadline = time.monotonic() + a.startup_timeout
             while not self.stopping and time.monotonic() < deadline:
-                code = self.process.poll()
+                code = process.poll()
                 if code is not None:
                     raise RuntimeError("Owned runtime exited during startup (code " + str(code) + ").")
                 try:
@@ -298,12 +372,19 @@ class DistributedRuntime:
             if not self.stopping:
                 print("Owned " + self.args.role + " is ready; keep this launcher running.", flush=True)
             while not self.stopping:
-                code = self.process.poll()
+                with self._runtime_lock:
+                    if self.stopping:
+                        break
+                    code = self.process.poll()
                 if code is not None:
                     raise RuntimeError("Owned runtime exited (code " + str(code) + "); no automatic model restart.")
                 time.sleep(0.2)
         finally:
             self.stop_runtime()
+            if self._notifier:
+                self._notifications.put(None)
+                # Local return is already confirmed. Give best-effort notifications a bounded flush.
+                self._notifier.join(timeout=5)
 
 
 def parser():
@@ -316,7 +397,11 @@ def parser():
         child.add_argument("--device", required=True, help="Explicit device list; server tensor proportions follow this order")
         child.add_argument("--startup-timeout", type=float, default=600, help="Seconds including model transfer/loading (default 600)")
         child.add_argument("--trusted-private-network", action="store_true", help="Acknowledge trusted peers, firewall isolation and non-sensitive data; RPC has no authentication")
+        child.add_argument("--coordinator", help="HTTPS Relay origin for GPU state notifications; token comes from RELAY_INFERENCE_PROVIDER_TOKEN")
+        child.add_argument("--gpu-id", action="append", default=[], help="Configured physical GPU ID owned here; repeat for multiple local GPUs")
+        child.add_argument("--gui", action="store_true", help="Show local providing/reclaiming/released status and an immediate stop button")
         if role == "rpc":
+            child.add_argument("--group", help="Configured group ID for coordinator reporting")
             child.add_argument("--port", type=int, default=50052)
             child.add_argument("--bind", required=True, help="Explicit RFC1918 or private-overlay 100.64/10 IPv4; never 0.0.0.0")
         else:
@@ -331,6 +416,58 @@ def parser():
     return p
 
 
+def gui_main(runtime):
+    import tkinter as tk
+    from tkinter import ttk
+
+    root = tk.Tk()
+    root.title("Relay · GPU 제공·회수")
+    root.minsize(460, 180)
+    status = tk.StringVar(value="실행 준비 중…")
+    ttk.Label(root, textvariable=status, padding=20, wraplength=440).pack(fill="x")
+    errors = []
+    closing = False
+
+    def run():
+        try:
+            runtime.run()
+        except Exception:
+            errors.append("실행 또는 반환 확인에 실패했습니다. 실행기 로그를 확인하세요.")
+
+    worker = threading.Thread(target=run)
+
+    def stop():
+        stop_button.configure(state="disabled")
+        status.set("회수 중 · 소유 실행 프로세스를 종료하는 중…")
+        threading.Thread(target=runtime.request_stop, daemon=True).start()
+
+    def close():
+        nonlocal closing
+        closing = True
+        stop()
+
+    stop_button = ttk.Button(root, text="GPU 제공 중단", command=stop)
+    stop_button.pack(pady=12)
+    labels = {"starting": "실행 준비 중…", "providing": "제공 중 · 모델 준비 또는 추론 실행 중",
+              "reclaiming": "회수 중 · 소유 실행 프로세스를 종료하는 중…",
+              "released": "반환 완료 · 소유 실행 프로세스 종료를 확인했습니다."}
+
+    def refresh():
+        status.set(errors[-1] if errors else labels[runtime.state])
+        if closing and runtime.state == "released":
+            root.destroy()
+            return
+        if not worker.is_alive():
+            stop_button.configure(state="normal" if runtime.process is not None else "disabled")
+        root.after(100, refresh)
+
+    root.protocol("WM_DELETE_WINDOW", close)
+    worker.start()
+    root.after(100, refresh)
+    root.mainloop()
+    return 1 if errors else 0
+
+
 def main(argv=None):
     p = parser()
     try:
@@ -339,9 +476,11 @@ def main(argv=None):
         p.error(str(exc))
     previous = {sig: signal.signal(sig, runtime.request_stop) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
+        if runtime.args.gui:
+            return gui_main(runtime)
         runtime.run()
         return 0
-    except (RuntimeError, OSError, ValueError) as exc:
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError) as exc:
         print("Distributed runtime: " + str(exc), file=sys.stderr)
         return 1
     finally:

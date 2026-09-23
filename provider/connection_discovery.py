@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 import hashlib
+from itertools import islice
 
 MAX_CONFIG_BYTES = 65536
 MAX_XDG_BYTES = 16384
@@ -145,6 +146,7 @@ class _Discovery:
         self.complete = True
         self.entries = 0
         self.candidates = 0
+        self.visited_paths = set()
 
     def warn(self, message, *, incomplete=False):
         with self.lock:
@@ -164,10 +166,27 @@ class _Discovery:
             return {"connections": connections, "roots": list(self.roots),
                     "warnings": list(self.warnings), "complete": self.complete}
 
-    def candidate(self, path):
+    def candidate(self, path, *, known=False):
         self.check()
+        path = Path(path).expanduser().absolute()
+        key = _path_key(path)
+        if key in self.visited_paths:
+            return
+        self.visited_paths.add(key)
+        self.candidates += 1
+        if self.candidates > self.max_candidates:
+            self.warn("연결 파일 수 제한에 도달했습니다. 필요한 연결 파일을 직접 선택해 주세요.", incomplete=True)
+            raise _Stopped()
         try:
-            before = path.lstat()
+            try:
+                before = path.lstat()
+            except FileNotFoundError:
+                if not known:
+                    raise
+                # A previously imported file may have been moved or deleted.
+                # It must not prevent a complete search of the current downloads.
+                self.warn("이전에 선택한 연결 파일을 찾지 못했습니다. 다운로드 폴더에서 계속 검색합니다.")
+                return
             if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
                 return
             if not _regular_file(before):
@@ -225,10 +244,6 @@ class _Discovery:
                         raise _Stopped()
                     if not _NAME.fullmatch(entry.name):
                         continue
-                    self.candidates += 1
-                    if self.candidates > self.max_candidates:
-                        self.warn("연결 파일 수 제한에 도달했습니다. 필요한 연결 파일을 직접 선택해 주세요.", incomplete=True)
-                        raise _Stopped()
                     self.candidate(Path(entry.path))
         except FileNotFoundError:
             if explicit:
@@ -236,9 +251,13 @@ class _Discovery:
         except OSError:
             self.warn("일부 다운로드 폴더를 읽을 수 없습니다. 폴더를 직접 선택해 주세요.", incomplete=True)
 
-    def run(self, roots, extra_roots):
+    def run(self, roots, extra_roots, known_paths):
         try:
             self.check()
+            # Only callers' previously selected files bypass the download name
+            # filter. Their parent directories are never implicitly scanned.
+            for path in known_paths:
+                self.candidate(path, known=True)
             # A selected folder remains useful even when another location stalls.
             for root in extra_roots:
                 self.walk(root, True)
@@ -258,13 +277,15 @@ class _Discovery:
             self.warn("연결 파일 검색 일부를 완료하지 못했습니다. 파일을 직접 선택해 주세요.", incomplete=True)
 
 
-def discover_connections(read_connection, *, roots=None, extra_roots=(), max_entries=2000,
+def discover_connections(read_connection, *, roots=None, extra_roots=(), known_paths=(), max_entries=2000,
                          max_candidates=50, max_seconds=4, cancel_event=None):
     """Return {connections:[{path,config,fingerprint}], roots, warnings, complete}.
 
     `read_connection(path)` must validate JSON with a maximum input of 64 KiB.
     `roots=` replaces per-user OS defaults for testing/manual targeted searches.
     Only the recognized Relay download names directly inside each root are read.
+    `known_paths=` validates up to 64 previously selected files first, regardless
+    of filename, sharing the candidate limit without scanning their parents.
     A timed-out OS read can finish later in a daemon thread; no partial result is
     considered complete, and no files or user settings are changed by this module.
     """
@@ -274,8 +295,13 @@ def discover_connections(read_connection, *, roots=None, extra_roots=(), max_ent
         roots = [roots]
     if isinstance(extra_roots, (str, os.PathLike)):
         extra_roots = [extra_roots]
+    if isinstance(known_paths, (str, os.PathLike)):
+        known_paths = [known_paths]
     roots = None if roots is None else list(roots)
     extra_roots = list(extra_roots)
+    known_paths = list(islice(known_paths, 65))
+    if len(known_paths) > 64:
+        raise ValueError("이전에 선택한 연결 파일은 최대 64개입니다.")
     if len(extra_roots) + (len(roots) if roots is not None else 0) > 64:
         raise ValueError("검색 폴더는 최대 64개입니다.")
     if isinstance(max_entries, bool) or not isinstance(max_entries, int) or not 1 <= max_entries <= 100000:
@@ -285,7 +311,7 @@ def discover_connections(read_connection, *, roots=None, extra_roots=(), max_ent
     if isinstance(max_seconds, bool) or not isinstance(max_seconds, (int, float)) or not 0.01 <= max_seconds <= 120:
         raise ValueError("max_seconds must be between 0.01 and 120")
     search = _Discovery(read_connection, max_entries, max_candidates, cancel_event)
-    worker = threading.Thread(target=search.run, args=(roots, extra_roots), daemon=True, name="relay-connection-scan")
+    worker = threading.Thread(target=search.run, args=(roots, extra_roots, known_paths), daemon=True, name="relay-connection-scan")
     worker.start()
     deadline = time.monotonic() + max_seconds
     while worker.is_alive():

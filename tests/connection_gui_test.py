@@ -66,15 +66,20 @@ class ConnectionGUITests(unittest.TestCase):
     def value(self, name):
         return self.widget("setting_" + name).get()
 
+    def connection_status(self):
+        label = self.widget("connection_discovery_status")
+        return str(self.root.getvar(label.cget("textvariable")))
+
     def replace(self, name, value):
         widget = self.widget("setting_" + name)
         widget.delete(0, "end")
         widget.insert(0, value)
 
     def scan_finished(self, minimum=1):
-        # GUI receives worker messages every 120 ms. Let a complete receive
-        # cycle pass after the bounded scanner returns before inspecting it.
-        return self.completed_scans >= minimum and time.monotonic() - self.last_scan_at >= 0.2
+        # Wait for the visible idle state as well as the scanner thread. A
+        # scanner can return before Tk applies its result or starts a rescan.
+        return (self.completed_scans >= minimum and time.monotonic() - self.last_scan_at >= 0.2
+                and self.widget("refresh_connection").cget("text") == "연결 다시 찾기")
 
     def run_gui(self, scenario, *, initial_config=None, result_filter=None):
         try:
@@ -93,7 +98,8 @@ class ConnectionGUITests(unittest.TestCase):
         original_discover = setup.connection_discovery.discover_connections
 
         def discover(*_args, **_kwargs):
-            result = original_discover(setup.read_connection, roots=[self.downloads])
+            options = {**_kwargs, "roots": [self.downloads]}
+            result = original_discover(setup.read_connection, **options)
             if result_filter is not None:
                 result = result_filter(result, self.completed_scans + 1)
             self.completed_scans += 1
@@ -177,6 +183,36 @@ class ConnectionGUITests(unittest.TestCase):
             self.assertNotIn(config["token"], str(self.widget("connection_candidates").cget("values")))
         self.run_gui(scenario)
 
+    def test_in_memory_pairing_survives_old_file_scan_when_save_fails(self):
+        self.write_connection(node="old-node")
+        executable = self.directory / "llama-server.exe"
+        executable.write_bytes(b"local runtime")
+        setup.save_preferences({"server": str(executable)}, self.preferences)
+        contract = setup.compute_contract({"server": str(executable), "rental_only": True}, 4096)
+        new_config = {"coordinator": "http://127.0.0.1:8788", "pool": "local-owner", "node": "new-node",
+                      "nodeName": "새 PC", "token": "new-secret-never-persist", "context": 4096, "model": contract}
+
+        def scenario():
+            yield lambda: self.scan_finished() and self.value("node") == "old-node"
+            self.assertEqual(self.value("server"), str(executable))
+            self.widget("next_connection").invoke()
+            yield lambda: str(self.widget("pair_device").cget("state")) == "normal"
+            self.assertEqual(self.widget("connection_window").state(), "normal")
+            self.replace("pair_code", "ABC-123")
+            self.replace("pc_name", "새 PC")
+            self.widget("pair_device").invoke()
+            yield lambda: self.value("node") == "new-node"
+            self.assertEqual(self.value("token"), new_config["token"])
+            previous = self.completed_scans
+            self.widget("refresh_connection").invoke()
+            yield lambda: self.scan_finished(previous + 1)
+            self.assertEqual(self.value("node"), "new-node")
+            self.assertEqual(self.value("token"), new_config["token"])
+            self.assertNotIn(new_config["token"], self.preferences.read_text(encoding="utf-8"))
+
+        with patch.object(setup, "pair_device", return_value=new_config), patch.object(setup, "save_paired_connection", side_effect=OSError("disk full")):
+            self.run_gui(scenario)
+
     def test_file_downloaded_after_open_is_detected_on_refresh(self):
         def scenario():
             yield self.scan_finished
@@ -230,6 +266,160 @@ class ConnectionGUITests(unittest.TestCase):
             self.assertEqual(self.value("node"), config["node"])
             self.assertEqual(self.value("token"), config["token"])
             self.assert_preferences_contain_only_paths(original, config["token"])
+        self.run_gui(scenario)
+
+    def test_explicit_refresh_reports_progress_and_empty_result(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def pause_explicit_refresh(result, number):
+            if number == 2:
+                entered.set()
+                release.wait(2)
+            return result
+
+        def scenario():
+            yield self.scan_finished
+            previous_status = self.connection_status()
+            refresh = self.widget("refresh_connection")
+            refresh.invoke()
+            self.assertEqual(str(refresh.cget("state")), "disabled")
+            self.assertNotEqual(self.connection_status(), previous_status)
+            self.assertRegex(self.connection_status(), r"(검색|확인).*중")
+            yield entered.is_set
+            release.set()
+            yield lambda: self.scan_finished(2)
+            self.assertEqual(str(refresh.cget("state")), "normal")
+            completed_status = self.connection_status()
+            self.assertIn("완료", completed_status)
+            self.assertIn("0개", completed_status)
+            self.assertIn(str(self.downloads), completed_status)
+            self.assertEqual(len(self.widget("connection_candidates").cget("values")), 0)
+            # Background polling must keep working without erasing the result
+            # of the user's explicit refresh a few seconds later.
+            yield lambda: self.scan_finished(3)
+            self.assertEqual(self.connection_status(), completed_status)
+
+        try:
+            self.run_gui(scenario, result_filter=pause_explicit_refresh)
+        finally:
+            release.set()
+
+    def test_saved_connection_outside_downloads_is_selected_after_refresh(self):
+        original, config = self.write_connection("this-pc-connection.json", node="saved-local",
+                                                 directory=self.directory)
+        setup.save_preferences({"connection_file": str(original)}, self.preferences)
+
+        def scenario():
+            yield lambda: (self.scan_finished() and self.value("node") == config["node"]
+                           and len(self.widget("connection_candidates").cget("values")) == 1)
+            picker = self.widget("connection_candidates")
+            self.assertEqual(len(picker.cget("values")), 1)
+            self.assertEqual(picker.current(), 0)
+            self.assertIn(original.name, picker.get())
+            previous = self.completed_scans
+            self.widget("refresh_connection").invoke()
+            yield lambda: self.scan_finished(previous + 1)
+            self.assertEqual(len(picker.cget("values")), 1)
+            self.assertEqual(picker.current(), 0)
+            self.assertIn(original.name, picker.get())
+            self.assertIn("완료", self.connection_status())
+            self.assertIn("1개", self.connection_status())
+            self.assertEqual(self.value("node"), config["node"])
+            self.assertEqual(self.value("token"), config["token"])
+            self.assertNotIn(config["token"], picker.get() + self.connection_status())
+            self.assert_preferences_contain_only_paths(original, config["token"])
+
+        self.run_gui(scenario)
+
+    def test_refresh_during_background_scan_shows_progress_and_retries(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def pause_first_scan(result, number):
+            if number == 1:
+                entered.set()
+                release.wait(3)
+            return result
+
+        def scenario():
+            yield entered.is_set
+            refresh = self.widget("refresh_connection")
+            self.assertFalse(refresh.instate(["disabled"]), "A background scan must not make refresh unresponsive")
+            refresh.invoke()
+            self.assertIn("검색하는 중", self.connection_status())
+            self.assertTrue(refresh.instate(["disabled"]))
+            release.set()
+            yield lambda: self.scan_finished(2) and not refresh.instate(["disabled"])
+            self.assertIn("완료", self.connection_status())
+            self.assertIn("0개", self.connection_status())
+
+        try:
+            self.run_gui(scenario, result_filter=pause_first_scan)
+        finally:
+            release.set()
+
+    def test_manually_imported_connection_outside_downloads_is_found_on_refresh(self):
+        selected, config = self.write_connection("selected-connection.json", node="manual-file",
+                                                 directory=self.directory)
+
+        def scenario():
+            yield self.scan_finished
+            pending = [self.widget("connection_setup")]
+            import_button = None
+            while pending:
+                widget = pending.pop()
+                if widget.winfo_class() == "TButton" and widget.cget("text") == "연결 파일 불러오기":
+                    import_button = widget
+                    break
+                pending.extend(widget.winfo_children())
+            self.assertIsNotNone(import_button)
+            with patch("tkinter.filedialog.askopenfilename", return_value=str(selected)) as dialog:
+                import_button.invoke()
+                dialog.assert_called_once()
+            yield lambda: self.value("node") == config["node"]
+            previous = self.completed_scans
+            self.widget("refresh_connection").invoke()
+            yield lambda: self.scan_finished(previous + 1)
+            picker = self.widget("connection_candidates")
+            self.assertEqual(len(picker.cget("values")), 1)
+            self.assertEqual(picker.current(), 0)
+            self.assertIn(selected.name, picker.get())
+            self.assertEqual(self.value("node"), config["node"])
+            self.assertEqual(self.value("token"), config["token"])
+            self.assert_preferences_contain_only_paths(selected, config["token"])
+
+        self.run_gui(scenario)
+
+    def test_manual_import_selects_new_connection_over_previous_candidate(self):
+        _, previous_config = self.write_connection(node="previous-download")
+        selected, config = self.write_connection("chosen-outside.json", node="chosen-external",
+                                                 directory=self.directory)
+
+        def scenario():
+            yield lambda: self.scan_finished() and self.value("node") == previous_config["node"]
+            picker = self.widget("connection_candidates")
+            self.assertIn(previous_config["node"], picker.get())
+            pending = [self.widget("connection_setup")]
+            import_button = None
+            while pending:
+                widget = pending.pop()
+                if widget.winfo_class() == "TButton" and widget.cget("text") == "연결 파일 불러오기":
+                    import_button = widget
+                    break
+                pending.extend(widget.winfo_children())
+            self.assertIsNotNone(import_button)
+            previous_scans = self.completed_scans
+            with patch("tkinter.filedialog.askopenfilename", return_value=str(selected)):
+                import_button.invoke()
+            yield lambda: self.value("node") == config["node"] and self.scan_finished(previous_scans + 1)
+            self.assertEqual(len(picker.cget("values")), 2)
+            self.assertIn(config["node"], picker.get())
+            self.assertIn(selected.name, picker.get())
+            self.assertNotIn(previous_config["node"], picker.get())
+            self.assertEqual(self.value("token"), config["token"])
+            self.assert_preferences_contain_only_paths(selected, config["token"])
+
         self.run_gui(scenario)
 
     def test_manual_credentials_are_not_overwritten_by_discovery(self):

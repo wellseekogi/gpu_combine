@@ -17,8 +17,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 import webbrowser
 from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 
 _spec = importlib.util.spec_from_file_location("relay_provider_runtime", Path(__file__).with_name("provider.py"))
@@ -76,6 +78,26 @@ def web_console_url(coordinator):
     return urlunsplit((address.scheme, address.netloc, "/", "", "connect-pc"))
 
 
+def default_coordinator(path=None):
+    """Use the service address shipped in the downloaded helper, if present."""
+    origin = os.environ.get("RELAY_SERVICE_ORIGIN")
+    if origin:
+        try:
+            return service_address(origin)
+        except ValueError:
+            pass
+    destination = Path(path) if path is not None else Path(__file__).with_name("service-config.json")
+    try:
+        with destination.open("rb") as source:
+            raw = source.read(MAX_CONFIG_BYTES + 1)
+        if len(raw) > MAX_CONFIG_BYTES:
+            raise ValueError("Service configuration exceeds limit")
+        config = json.loads(raw.decode("utf-8-sig"))
+        return service_address(config["coordinator"])
+    except (OSError, UnicodeError, ValueError, TypeError, KeyError):
+        return "http://127.0.0.1:8788"
+
+
 def connection_config(data):
     """Validate a downloaded connection file; deliberately discard local paths."""
     if not isinstance(data, dict):
@@ -119,6 +141,76 @@ def read_connection(path):
         return connection_config(json.loads(raw.decode("utf-8-sig")))
     except (UnicodeError, json.JSONDecodeError):
         raise ValueError("올바른 JSON 연결 파일을 선택해 주세요.") from None
+
+
+def paired_connection_path():
+    # ponytail: one remembered pairing per PC; add a selector if multi-service use matters.
+    return preferences_path().with_name("provider-connection.json")
+
+
+def save_paired_connection(config, path=None):
+    """Keep a paired node key in the user's private profile, outside preferences."""
+    destination = Path(path) if path is not None else paired_connection_path()
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(destination.parent, 0o700)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=destination.parent,
+                                         prefix=".provider-connection-", suffix=".tmp", delete=False) as output:
+            temporary = Path(output.name)
+            json.dump({"version": 1, **connection_config(config)}, output, ensure_ascii=False)
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        temporary.replace(destination)
+        return str(destination)
+    finally:
+        if temporary and temporary.exists():
+            temporary.unlink()
+
+
+def pair_device(coordinator, code, name, model_name, contract, vram_mib, request):
+    """Register a locally checked runtime with a one-use website pairing code."""
+    address = service_address(coordinator)
+    if urlsplit(address).path not in ("", "/"):
+        raise ValueError("서비스 주소에는 도메인만 입력해 주세요.")
+    if (not isinstance(code, str) or not 1 <= len(code.strip()) <= 128
+            or any(ord(character) < 33 or ord(character) > 126 for character in code.strip())):
+        raise ValueError("웹에서 발급한 페어링 코드를 입력해 주세요.")
+    for value, limit, label in ((name, 80, "PC 이름"), (model_name, 100, "모델 이름")):
+        if (not isinstance(value, str) or not value.strip() or len(value.strip()) > limit
+                or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in value)):
+            raise ValueError(f"{label}을 확인해 주세요.")
+    if type(vram_mib) is not int or not 1 <= vram_mib <= 200000:
+        raise ValueError("GPU 메모리 범위를 확인해 주세요.")
+    if (not isinstance(request, dict) or not isinstance(request.get("requestId"), str)
+            or not re.fullmatch(r"[a-zA-Z0-9-]{16,80}", request["requestId"])
+            or not isinstance(request.get("token"), str)
+            or not re.fullmatch(r"[a-f0-9-]{72}", request["token"])):
+        raise ValueError("새 PC 연결 키를 만들지 못했습니다.")
+    payload = {"code": code.strip(), **request, "name": name.strip(), "modelName": model_name.strip(),
+               "model": contract, "vram": vram_mib}
+    try:
+        response = runtime.request_json(address + "/api/participation/pair", payload, timeout=12)
+    except HTTPError as exc:
+        if exc.code in (400, 401, 403, 404, 409, 410):
+            raise ValueError("페어링 코드를 확인하거나 웹에서 새 코드를 발급해 주세요.") from None
+        if exc.code == 429:
+            raise ValueError("연결 시도가 많습니다. 잠시 후 다시 시도해 주세요.") from None
+        raise ValueError(f"서버가 연결을 거절했습니다 (HTTP {exc.code}).") from None
+    except (URLError, TimeoutError, ConnectionError):
+        raise ValueError("서버에 연결하지 못했습니다. 주소와 네트워크를 확인해 주세요.") from None
+    try:
+        config = connection_config(response["config"])
+        model = config["model"]
+        if (config["coordinator"] != address or config["pool"] != "local-owner"
+                or config["token"] != request["token"] or config.get("nodeName") != name.strip()
+                or model != {"modelDigest": contract["modelDigest"], "runtime": contract["runtime"],
+                             "template": contract["template"], "context": contract["context"]}):
+            raise ValueError()
+        return config
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("서버의 PC 연결 응답을 확인할 수 없습니다.") from None
 
 
 PREFERENCE_PATHS = {"server": "llama-server", "model": "GGUF 모델", "template": "채팅 템플릿", "connection_file": "연결 파일", "search_folder": "모델 검색 폴더", "connection_folder": "연결 파일 검색 폴더", "runtime_search_folder": "실행기 검색 폴더"}
@@ -246,8 +338,10 @@ def prepare_model_template(model_path, destination, timeout=20):
 
 
 def local_files(data):
-    result = {}
-    for key, label in (("server", "llama-server 실행 파일"), ("model", "GGUF 모델"), ("template", "채팅 템플릿")):
+    rental_only = data.get("rental_only") is True
+    result = {"rental_only": True} if rental_only else {}
+    required = (("server", "llama-server 실행 파일"),) if rental_only else (("server", "llama-server 실행 파일"), ("model", "GGUF 모델"), ("template", "채팅 템플릿"))
+    for key, label in required:
         path = Path(data.get(key, "")).expanduser()
         if not path.is_file():
             raise ValueError(f"{label}을 선택해 주세요.")
@@ -257,10 +351,12 @@ def local_files(data):
 
 def compute_contract(files, context):
     files = local_files(files)
-    return {"version": 1, "modelDigest": runtime.digest_file(files["model"]),
+    rental_only = files.get("rental_only", False)
+    return {"version": 1, "modelDigest": "0" * 64 if rental_only else runtime.digest_file(files["model"]),
             "runtime": runtime.digest_file(files["server"]),
-            "template": runtime.digest_file(files["template"]),
-            "context": integer(context, "컨텍스트", 4096, 131072)}
+            "template": "0" * 64 if rental_only else runtime.digest_file(files["template"]),
+            "context": integer(context, "컨텍스트", 4096, 131072),
+            **({"runtimeOnly": True} if rental_only else {})}
 
 
 def match_contract(actual, expected):
@@ -421,8 +517,13 @@ def worker_main():
             return super().start_runtime()
 
         def infer(self, task):
-            event("문서를 처리하는 중…")
+            event("LLM 응답을 생성하는 중…" if task.get("kind") == "chat" else "문서를 처리하는 중…")
             return super().infer(task)
+
+        def execute_task(self, task):
+            if task.get("modelArtifact"):
+                event("대여자가 올린 LLM을 내려받는 중…")
+            return super().execute_task(task)
 
     class HiddenSubprocess:
         DEVNULL = subprocess.DEVNULL
@@ -471,7 +572,7 @@ def gui_main(initial_config=None):
     from tkinter.scrolledtext import ScrolledText
 
     root = tk.Tk()
-    root.title("Relay · 모델 찾기 및 GPU 참여 설정")
+    root.title("Relay · 1단계 모델 실행 준비")
     root.geometry("820x700")
     root.minsize(680, 600)
     style = ttk.Style(root)
@@ -486,8 +587,8 @@ def gui_main(initial_config=None):
     body = ttk.Frame(root, padding=24)
     body.pack(fill="both", expand=True)
     body.columnconfigure(0, weight=1)
-    ttk.Label(body, text="내 GPU로 함께하기", style="Title.TLabel").grid(sticky="w")
-    ttk.Label(body, text="이미 받은 모델을 자동으로 찾아 드립니다. 목록에서 선택하거나 저장한 폴더를 추가하세요.", wraplength=720).grid(sticky="w", pady=(5, 16))
+    ttk.Label(body, text="1  모델 실행 준비", style="Title.TLabel").grid(sticky="w")
+    ttk.Label(body, text="모델과 실행기를 선택하고 파일 검사를 마치면 ‘다음: 연결 설정’으로 이동하세요.", wraplength=720).grid(sticky="w", pady=(5, 16))
     form_holder = ttk.Frame(body)
     form_holder.grid(sticky="nsew", pady=(0, 12))
     form_holder.rowconfigure(0, weight=1)
@@ -508,20 +609,64 @@ def gui_main(initial_config=None):
             form_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
     root.bind("<MouseWheel>", scroll_form)
     body.rowconfigure(2, weight=1)
+
+    # Connection setup is its own window. Only one step is visible at a time;
+    # keeping both widgets alive preserves selections while moving backwards.
+    connection_window = tk.Toplevel(root, name="connection_window")
+    connection_window.withdraw()
+    connection_window.title("Relay · 2단계 연결 설정 및 GPU 참여")
+    connection_window.geometry("820x760")
+    connection_window.minsize(680, 650)
+    connection_body = ttk.Frame(connection_window, padding=24)
+    connection_body.pack(fill="both", expand=True)
+    connection_body.columnconfigure(0, weight=1)
+    ttk.Label(connection_body, text="2  연결 설정", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+    ttk.Label(connection_body, text="기존 연결을 불러왔다면 그대로 참여를 시작하세요. 처음 연결하는 PC만 페어링 코드를 입력합니다.",
+              wraplength=720).grid(row=1, column=0, sticky="ew", pady=(5, 16))
+    connection_model_summary = tk.StringVar(value="")
+    ttk.Label(connection_body, textvariable=connection_model_summary, wraplength=720,
+              name="prepared_model_summary").grid(row=2, column=0, sticky="ew", pady=(0, 12))
+    connection_form_holder = ttk.Frame(connection_body)
+    connection_form_holder.grid(row=3, column=0, sticky="nsew", pady=(0, 12))
+    connection_body.rowconfigure(3, weight=1)
+    connection_form_holder.rowconfigure(0, weight=1)
+    connection_form_holder.columnconfigure(0, weight=1)
+    connection_canvas = tk.Canvas(connection_form_holder, background="#f4f6fa", highlightthickness=0)
+    connection_canvas.grid(row=0, column=0, sticky="nsew")
+    connection_scroll = ttk.Scrollbar(connection_form_holder, orient="vertical", command=connection_canvas.yview)
+    connection_scroll.grid(row=0, column=1, sticky="ns")
+    connection_canvas.configure(yscrollcommand=connection_scroll.set)
+    connection_form = ttk.Frame(connection_canvas)
+    connection_form.columnconfigure(0, weight=1)
+    connection_form_window = connection_canvas.create_window(0, 0, anchor="nw", window=connection_form)
+    connection_form.bind("<Configure>", lambda _: connection_canvas.configure(scrollregion=connection_canvas.bbox("all")))
+    connection_canvas.bind("<Configure>", lambda event: connection_canvas.itemconfigure(connection_form_window, width=event.width))
+    def scroll_connection(event):
+        if str(event.widget).startswith(str(connection_form)) or event.widget == connection_canvas:
+            connection_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+    connection_window.bind("<MouseWheel>", scroll_connection)
     messages = queue.Queue()
     worker = WorkerProcess(messages)
     variables = {key: tk.StringVar(value=value) for key, value in {
-        "coordinator": "http://127.0.0.1:8788", "pool": "local-owner", "node": "", "token": "",
-        "server": "", "model": "", "template": "", "context": "8192", "port": "8081", "gpu_layers": "99"}.items()}
+        "coordinator": default_coordinator(), "pool": "local-owner", "node": "", "token": "",
+        "server": "", "model": "", "template": "", "context": "8192", "port": "8081", "gpu_layers": "99",
+        "pair_code": "", "pc_name": "", "vram_gib": "8"}.items()}
+    rental_only = tk.BooleanVar(value=True)
     state = {"expected": None, "contract": None, "busy": False, "closing": False, "stopping": False, "connection_file": "", "importing": False, "search_folder": "", "discovering": False, "discovered": {}, "discovery_cancel": threading.Event()}
     state.update({"connection_folder": "", "connection_scanning": False, "connection_candidates": [],
                   "connection_manual": False, "connection_scan_warnings": (), "connection_generation": 0,
-                  "connection_auto_watch": True, "connection_restore_failed": False})
-    state.update({"runtime_searching": False, "runtime_candidates": [], "runtime_search_folder": "", "preferences_restore_failed": False})
+                  "connection_auto_watch": True, "connection_restore_failed": False,
+                  "connection_refresh_requested": False, "connection_scan_feedback": False,
+                  "connection_active_refresh": False, "loaded_connection": None})
+    state.update({"runtime_searching": False, "runtime_candidates": [], "runtime_search_folder": "", "preferences_restore_failed": False,
+                  "preferences_loaded": False, "step": "model", "pair_request": None, "open_pairing_after_scan": False})
     editable = []
 
     def values(*keys):
         return {key: variables[key].get() for key in keys}
+
+    def selected_files():
+        return {**values("server", "model", "template"), **({"rental_only": True} if rental_only.get() else {})}
 
     def connection():
         data = values("coordinator", "pool", "node", "token", "context")
@@ -543,24 +688,38 @@ def gui_main(initial_config=None):
         state["importing"] = True
         try:
             for key in ("coordinator", "pool", "node", "token", "context"):
-                variables[key].set(config[key])
+                if variables[key].get() != str(config[key]):
+                    variables[key].set(config[key])
         finally:
             state["importing"] = False
         state["expected"] = config.get("model")
-        state["connection_file"] = str(Path(path).absolute())
+        if state["expected"]:
+            requested_mode = state["expected"].get("modelDigest") == "0" * 64 and state["expected"].get("template") == "0" * 64
+            if requested_mode != rental_only.get():
+                rental_only.set(requested_mode)
+        state["connection_file"] = str(Path(path).absolute()) if path else ""
+        state["loaded_connection"] = config
+        connection_picker.set("")
+        state["connection_generation"] += 1
         state["connection_manual"] = False
         state["connection_restore_failed"] = False
         label = config.get("nodeName") or config["node"][:48]
-        connection_summary.set(("자동으로 불러옴 · " if automatic else "불러옴 · ") + config["coordinator"] + " · " + label)
-        status.set("연결 정보를 불러왔습니다. 준비되면 ‘검사하고 참여 시작’을 눌러 주세요."
-                   if all(variables[key].get() for key in ("server", "model", "template"))
-                   else "연결 정보를 불러왔습니다. 이 PC의 모델 파일을 선택해 주세요.")
+        connection_summary.set(("자동으로 불러옴 · " if automatic else "불러옴 · ") + config["coordinator"] + " · " + label
+                               + ("\n내 PC에 저장된 연결 정보: " + state["connection_file"] if path else "\n이번 실행에서만 연결 정보 유지"))
+        connection_model_summary.set(("GPU만 제공 · 이용자가 올린 모델 실행" if rental_only.get() else "준비한 모델: " + Path(variables["model"].get()).name)
+                                     + "\n현재 서비스: " + config["coordinator"])
+        status.set("이전 연결 정보를 불러왔습니다. 파일 검사 후 ‘다음: 연결 설정’으로 이동하세요."
+                   if state["step"] == "model" and restoring else
+                   "연결 정보를 불러왔습니다. 모델 준비를 마친 뒤 ‘다음: 연결 설정’으로 이동하세요."
+                   if state["step"] == "model" else
+                   "연결 정보를 불러왔습니다. 준비되면 ‘검사하고 참여 시작’을 눌러 주세요.")
         if not restoring:
             remember_selection()
+        root.after(0, scan_connections)
         return True
 
     def import_config(path=None, restoring=False):
-        path = path or filedialog.askopenfilename(title="Relay 연결 파일 선택", filetypes=[("Relay 연결 파일", "*.json")])
+        path = path or filedialog.askopenfilename(parent=connection_window, title="Relay 연결 파일 선택", filetypes=[("Relay 연결 파일", "*.json")])
         if not path:
             return
         state["busy"] = True
@@ -580,19 +739,72 @@ def gui_main(initial_config=None):
             address = web_console_url(variables["coordinator"].get())
             if not webbrowser.open(address):
                 raise OSError("browser unavailable")
-            status.set("웹에서 모델 승인 → PC 등록 → 연결 설정 저장을 누르세요. 다운로드가 끝나면 이 창에서 자동으로 찾습니다.")
+            status.set("웹에서 개인 계정에 로그인하고 페어링 코드를 발급받아 이 창에 입력하세요.")
         except ValueError as exc:
-            messagebox.showerror("서비스 주소 확인", str(exc), parent=root)
+            messagebox.showerror("서비스 주소 확인", str(exc), parent=connection_window)
         except OSError:
-            messagebox.showerror("웹 설정 열기", "브라우저를 열지 못했습니다. 고급 설정에 표시된 서비스 주소를 브라우저에서 열어 주세요.", parent=root)
+            messagebox.showerror("웹 설정 열기", "브라우저를 열지 못했습니다. 고급 설정에 표시된 서비스 주소를 브라우저에서 열어 주세요.", parent=connection_window)
 
-    group = ttk.LabelFrame(form, text="2  Relay에 이 PC 연결하기", name="connection_setup")
-    group.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+    pair_group = ttk.LabelFrame(connection_form, text="새 PC를 페어링 코드로 연결", name="pairing_setup")
+    pair_group.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+    pair_group.columnconfigure(1, weight=1)
+    ttk.Label(pair_group, text="웹의 ‘내 GPU 제공’에서 코드를 발급받으세요. 이 PC에서 검사한 실행 환경을 서버에 바로 등록합니다.",
+              wraplength=620).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+    for row, (key, label) in enumerate((("pair_code", "페어링 코드"), ("pc_name", "PC 이름"), ("vram_gib", "제공할 GPU 메모리 (GB)")), start=1):
+        ttk.Label(pair_group, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
+        entry = ttk.Entry(pair_group, name="setting_" + key, textvariable=variables[key])
+        entry.grid(row=row, column=1, sticky="ew")
+        editable.append(entry)
+
+    def pair():
+        if state["busy"] or worker.running or state["closing"]:
+            return
+        try:
+            if not state["contract"]:
+                raise ValueError("먼저 실행 파일을 검사해 주세요.")
+            memory_gib = float(variables["vram_gib"].get())
+            if not 1 <= memory_gib <= 195 or memory_gib * 2 % 1:
+                raise ValueError("GPU 메모리는 1~195 GB를 0.5 GB 단위로 입력해 주세요.")
+            memory_mib = int(memory_gib * 1024)
+            files = selected_files()
+            model_name = "GPU 실행 환경" if rental_only.get() else Path(files["model"]).stem[:100]
+            code, name = variables["pair_code"].get().strip(), variables["pc_name"].get().strip()
+            fingerprint = (variables["coordinator"].get(), code, name, model_name,
+                           json.dumps(state["contract"], sort_keys=True), memory_mib)
+            if state["pair_request"] is None or state["pair_request"][0] != fingerprint:
+                state["pair_request"] = (fingerprint, {"requestId": str(uuid.uuid4()), "token": str(uuid.uuid4()) + str(uuid.uuid4())})
+            request = state["pair_request"][1]
+        except (ValueError, OverflowError) as exc:
+            messagebox.showerror("PC 바로 연결", str(exc), parent=connection_window)
+            return
+        state["busy"] = True
+        lock(True)
+        status.set("서버에 PC를 등록하는 중…")
+
+        def send():
+            try:
+                config = pair_device(fingerprint[0], code, name, model_name, state["contract"], memory_mib, request)
+                try:
+                    path, notice = save_paired_connection(config), ""
+                except OSError:
+                    path, notice = None, "로컬 연결 정보를 저장하지 못했습니다. 이번 실행에서는 참여할 수 있지만 다음 실행에는 새 페어링 코드가 필요합니다."
+                messages.put(("paired", (config, path, notice)))
+            except (ValueError, OSError) as exc:
+                messages.put(("pair-error", str(exc)))
+            except Exception:
+                messages.put(("pair-error", "PC 연결을 완료하지 못했습니다. 다시 시도해 주세요."))
+        threading.Thread(target=send, daemon=True).start()
+
+    pair_button = ttk.Button(pair_group, name="pair_device", text="서버에 바로 연결", command=pair, state="disabled")
+    pair_button.grid(row=4, column=1, sticky="e", pady=(8, 0))
+    group = ttk.LabelFrame(connection_form, text="기존 연결 파일 사용", name="connection_setup")
+    group.grid(row=1, column=0, sticky="ew", pady=(0, 12))
     group.columnconfigure(0, weight=1)
     connection_summary = tk.StringVar(value="웹에서 받은 연결 파일을 다운로드 폴더에서 자동으로 찾습니다.")
     connection_summary_label = ttk.Label(group, textvariable=connection_summary, wraplength=620)
     connection_summary_label.grid(row=0, column=0, sticky="ew", pady=(0, 8))
     connection_search_status = tk.StringVar(value="연결 파일을 확인하는 중…")
+    connection_controls_notice = tk.StringVar(value="")
     connection_status_label = ttk.Label(group, textvariable=connection_search_status, wraplength=620, name="connection_discovery_status")
     connection_status_label.grid(row=1, column=0, sticky="ew")
     connection_picker = ttk.Combobox(group, state="disabled", name="connection_candidates")
@@ -606,7 +818,9 @@ def gui_main(initial_config=None):
         connection_picker.configure(state="readonly" if count and not locked else "disabled")
         use_connection_button.configure(state="normal" if 0 <= connection_picker.current() < count and not locked else "disabled")
         connection_folder_button.configure(state="disabled" if locked else "normal")
-        connection_refresh_button.configure(state="disabled" if locked or state["connection_scanning"] else "normal")
+        connection_refresh_button.configure(state="disabled" if locked or state["connection_active_refresh"] else "normal")
+        connection_controls_notice.set("참여 중에는 연결 변경과 재검색이 잠깁니다. 바꾸려면 ‘참여 중지’를 누르세요."
+                                       if worker.running else "파일을 확인하는 동안 잠시 기다려 주세요." if state["busy"] else "")
 
     def choose_connection():
         index = connection_picker.current()
@@ -618,16 +832,29 @@ def gui_main(initial_config=None):
         apply_connection(candidate["config"], candidate["path"])
         connection_search_status.set("선택한 연결 정보를 불러왔습니다. ‘검사하고 참여 시작’을 눌러야 실행됩니다.")
 
-    def scan_connections():
+    def scan_connections(*, refresh=False):
+        if refresh:
+            state["connection_refresh_requested"] = True
+            state["connection_scan_feedback"] = True
+            state["connection_active_refresh"] = True
+            connection_search_status.set("연결 파일을 검색하는 중… 다운로드 폴더와 현재 연결 파일을 확인합니다.")
+            connection_refresh_button.configure(text="검색 중…")
+            update_connection_controls()
         if state["closing"] or state["connection_scanning"] or state["busy"] or worker.running:
             return
         state["connection_scanning"] = True
+        connection_refresh_button.configure(text="검색 중…" if state["connection_active_refresh"] else "자동 검색 중…")
+        if state["connection_refresh_requested"]:
+            state["connection_refresh_requested"] = False
         update_connection_controls()
         extra = [state["connection_folder"]] if state["connection_folder"] else []
+        # A failed restore may still have an OS read waiting on an offline
+        # folder. Do not repeat that read before searching healthy downloads.
+        known = [state["connection_file"]] if state["loaded_connection"] else []
         generation = state["connection_generation"]
         def inspect():
             try:
-                result = connection_discovery.discover_connections(read_connection, extra_roots=extra,
+                result = connection_discovery.discover_connections(read_connection, extra_roots=extra, known_paths=known,
                                                                    cancel_event=state["discovery_cancel"])
             except Exception:
                 result = {"connections": [], "roots": [], "complete": False,
@@ -636,42 +863,53 @@ def gui_main(initial_config=None):
         threading.Thread(target=inspect, daemon=True).start()
 
     def choose_connection_folder():
-        path = filedialog.askdirectory(title="연결 파일을 다운로드한 폴더 선택")
+        path = filedialog.askdirectory(parent=connection_window, title="연결 파일을 다운로드한 폴더 선택")
         if path:
             state["connection_folder"] = path
             state["connection_generation"] += 1
             remember_selection()
-            scan_connections()
+            scan_connections(refresh=True)
 
     use_connection_button = ttk.Button(connection_actions, text="선택한 연결 사용", name="use_connection", command=choose_connection, state="disabled")
     use_connection_button.pack(side="left")
-    connection_refresh_button = ttk.Button(connection_actions, text="연결 다시 찾기", name="refresh_connection", command=scan_connections)
+    connection_refresh_button = ttk.Button(connection_actions, text="연결 다시 찾기", name="refresh_connection", command=lambda: scan_connections(refresh=True))
     connection_refresh_button.pack(side="left", padx=6)
     connection_folder_button = ttk.Button(connection_actions, text="연결 폴더 선택", command=choose_connection_folder)
     connection_folder_button.pack(side="left")
     connection_picker.bind("<<ComboboxSelected>>", update_connection_controls)
     manual_actions = ttk.Frame(group)
     manual_actions.grid(row=4, column=0, sticky="ew", pady=(8, 0))
-    import_button = ttk.Button(manual_actions, text="연결 파일 불러오기", command=import_config)
+    import_button = ttk.Button(manual_actions, name="import_connection", text="연결 파일 불러오기", command=import_config)
     import_button.pack(side="left")
     editable.append(import_button)
-    ttk.Button(manual_actions, text="연결 파일이 없나요? 웹 설정 열기", command=open_web_setup).pack(side="left", padx=6)
-    help_label = ttk.Label(group, text="연결 파일에는 Relay 주소, PC 정보, 비밀 참여 키가 들어 있습니다. 웹에서 PC 등록 → ‘연결 설정 저장’을 누르면 자동으로 감지합니다. 여러 연결이 있으면 서비스 주소와 PC 이름을 보고 선택하세요. 다른 폴더에 저장했다면 ‘연결 폴더 선택’을 누르세요.", wraplength=620)
+    ttk.Button(manual_actions, text="페어링 코드 받기 · 웹 열기", command=open_web_setup).pack(side="left", padx=6)
+    help_label = ttk.Label(group, text="연결 파일에는 Relay 주소, PC 정보, 비밀 참여 키가 들어 있습니다. 웹에서 내 GPU 연결하기 → 개인 계정 로그인 → 내 GPU 등록하기 → ‘연결 설정 저장’을 누르면 자동으로 감지합니다. 여러 연결이 있으면 서비스 주소와 PC 이름을 보고 선택하세요. 다른 폴더에 저장했다면 ‘연결 폴더 선택’을 누르세요.", wraplength=620)
     help_label.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+    controls_notice_label = ttk.Label(group, name="connection_controls_notice", textvariable=connection_controls_notice,
+                                      foreground="#8b4e00", wraplength=620)
+    controls_notice_label.grid(row=6, column=0, sticky="ew", pady=(8, 0))
     def wrap_connection(event):
-        for label in (connection_summary_label, connection_status_label, help_label):
+        for label in (connection_summary_label, connection_status_label, help_label, controls_notice_label):
             label.configure(wraplength=max(300, event.width - 35))
     group.bind("<Configure>", wrap_connection)
 
     def watch_connections():
         if state["closing"]:
             return
-        if state["connection_auto_watch"]:
+        if state["preferences_loaded"] and state["connection_auto_watch"]:
             scan_connections()
         root.after(3000, watch_connections)
 
-    discovery_group = ttk.LabelFrame(form, text="1  이 컴퓨터에 저장된 모델")
-    discovery_group.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+    mode_group = ttk.Frame(form)
+    mode_group.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+    rental_mode_button = ttk.Checkbutton(mode_group, name="rental_only", variable=rental_only,
+                                        text="GPU만 제공 (실행자의 모델 사용)")
+    rental_mode_button.pack(anchor="w")
+    editable.append(rental_mode_button)
+    ttk.Label(mode_group, text="실행기만 준비하면 됩니다. 이용자가 올린 GGUF는 요청 동안 내려받아 실행하고 종료 후 삭제합니다.",
+              wraplength=650).pack(anchor="w", pady=(4, 0))
+    discovery_group = ttk.LabelFrame(form, text="이 컴퓨터에 저장된 모델", name="model_setup")
+    discovery_group.grid(row=1, column=0, sticky="ew", pady=(0, 12))
     discovery_group.columnconfigure(0, weight=1)
     discovery_summary = tk.StringVar(value="Windows와 WSL의 모델 저장 위치를 확인하고 있습니다…")
     ttk.Label(discovery_group, textvariable=discovery_summary, wraplength=650).grid(row=0, column=0, sticky="w", pady=(0, 8))
@@ -790,8 +1028,8 @@ def gui_main(initial_config=None):
     model_tree.bind("<<TreeviewSelect>>", update_model_selection)
     model_tree.bind("<Double-1>", lambda _event: choose_discovered_model())
 
-    files_group = ttk.LabelFrame(form, text="선택한 GGUF 모델의 실행 준비")
-    files_group.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+    files_group = ttk.LabelFrame(form, text="GPU 실행 환경 준비")
+    files_group.grid(row=2, column=0, sticky="ew", pady=(0, 12))
     files_group.columnconfigure(1, weight=1)
 
     def choose_file(key):
@@ -872,14 +1110,17 @@ def gui_main(initial_config=None):
     runtime_picker.bind("<<ComboboxSelected>>", select_runtime)
     files_group.bind("<Configure>", lambda event: runtime_summary_label.configure(wraplength=max(300, event.width - 35)))
 
+    model_file_widgets = []
     for row, (key, label) in enumerate((("model", "GGUF 모델"), ("template", "채팅 템플릿")), start=4):
-        ttk.Label(files_group, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=6)
+        caption = ttk.Label(files_group, text=label)
+        caption.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=6)
         entry = ttk.Entry(files_group, name="setting_" + key, textvariable=variables[key])
         entry.grid(row=row, column=1, sticky="ew")
         button = ttk.Button(files_group, text="찾아보기", command=lambda k=key: choose_file(k))
         button.grid(row=row, column=2, padx=(8, 0))
         editable.extend((entry, button))
-    ttk.Label(files_group, text="목록에서 모델을 선택하면 내장 템플릿이 자동 입력됩니다. 자동으로 찾은 llama-server를 목록에서 선택하고 ‘파일 검사’를 누르세요. 연결 파일은 아직 없어도 됩니다.\n검사가 끝나면 ‘모델 검증 파일 저장’을 눌러 웹에서 승인할 파일을 만드세요.", wraplength=650).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        model_file_widgets.extend((caption, entry, button))
+    ttk.Label(files_group, text="실행기를 확인한 뒤 ‘서버에 바로 연결’을 누르세요. 파일 검사는 도우미가 진행합니다.", wraplength=650).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
     settings = ttk.Frame(form)
     settings.grid(row=3, column=0, sticky="ew", pady=(0, 8))
@@ -898,38 +1139,100 @@ def gui_main(initial_config=None):
 
     advanced_button = ttk.Button(settings, text="고급 설정 ▸", command=toggle_advanced)
     advanced_button.grid(row=0, column=0, sticky="w")
-    for row, (key, label) in enumerate((("coordinator", "서비스 주소"), ("pool", "풀 ID"),
-                                       ("node", "참여 PC ID"), ("token", "참여 키"),
-                                       ("context", "컨텍스트"), ("port", "로컬 포트"), ("gpu_layers", "GPU 레이어"))):
+    for row, (key, label) in enumerate((("context", "컨텍스트"), ("port", "로컬 포트"), ("gpu_layers", "GPU 레이어"))):
         ttk.Label(advanced, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
         entry = ttk.Entry(advanced, name="setting_" + key, textvariable=variables[key], show="●" if key == "token" else "")
         entry.grid(row=row, column=1, sticky="ew")
         editable.append(entry)
     advanced.grid_remove()
 
-    status = tk.StringVar(value="연결 파일 없이 시작하세요. 위 목록에서 모델 선택 → 실행파일 확인 → 파일 검사.")
+    connection_settings = ttk.Frame(connection_form)
+    connection_settings.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+    connection_settings.columnconfigure(0, weight=1)
+    connection_advanced = ttk.Frame(connection_settings, padding=(4, 12))
+    connection_advanced.grid(row=1, column=0, sticky="ew")
+    connection_advanced.columnconfigure(1, weight=1)
+
+    def toggle_connection_advanced():
+        if connection_advanced.winfo_manager():
+            connection_advanced.grid_remove()
+            connection_advanced_button.configure(text="연결 정보 직접 입력 ▸")
+        else:
+            connection_advanced.grid()
+            connection_advanced_button.configure(text="연결 정보 직접 입력 ▾")
+
+    connection_advanced_button = ttk.Button(connection_settings, text="연결 정보 직접 입력 ▸", command=toggle_connection_advanced)
+    connection_advanced_button.grid(row=0, column=0, sticky="w")
+    for row, (key, label) in enumerate((("coordinator", "서비스 주소"), ("pool", "풀 ID"),
+                                       ("node", "참여 PC ID"), ("token", "참여 키"))):
+        ttk.Label(connection_advanced, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=5)
+        entry = ttk.Entry(connection_advanced, name="setting_" + key, textvariable=variables[key], show="●" if key == "token" else "")
+        entry.grid(row=row, column=1, sticky="ew")
+        editable.append(entry)
+    connection_advanced.grid_remove()
+
+    status = tk.StringVar(value="실행파일을 확인하고 ‘서버에 바로 연결’을 누르세요.")
     status_label = ttk.Label(body, textvariable=status, wraplength=720, foreground="#176548")
     status_label.grid(sticky="ew", pady=(0, 12))
     body.bind("<Configure>", lambda event: status_label.configure(wraplength=max(300, event.width - 48)))
     actions = ttk.Frame(body)
     actions.grid(sticky="ew", pady=(0, 12))
+    connection_status = ttk.Label(connection_body, name="connection_step_status", textvariable=status, wraplength=720, foreground="#176548")
+    connection_status.grid(row=4, column=0, sticky="ew", pady=(0, 12))
+    connection_actions_footer = ttk.Frame(connection_body)
+    connection_actions_footer.grid(row=5, column=0, sticky="ew", pady=(0, 12))
+
+    def update_navigation():
+        locked = state["busy"] or worker.running or state["closing"]
+        next_button.configure(state="disabled" if locked else "normal")
+        back_button.configure(state="disabled" if locked else "normal")
+        connection_export_button.configure(state="normal" if state["contract"] and not locked else "disabled")
+        pair_button.configure(state="normal" if state["contract"] and not locked else "disabled")
+        required = ("server", "coordinator", "pool", "node", "token") + (() if rental_only.get() else ("model", "template"))
+        ready = all(variables[key].get().strip() for key in required)
+        start_button.configure(state="normal" if ready and not locked else "disabled")
+
+    def show_connection_step():
+        if not state["contract"] or state["busy"] or worker.running or state["closing"]:
+            return
+        state["step"] = "connection"
+        connection_model_summary.set(("GPU만 제공 · 이용자가 올린 모델 실행" if rental_only.get() else "준비한 모델: " + Path(variables["model"].get()).name)
+                                     + "\n현재 서비스: " + variables["coordinator"].get())
+        root.withdraw()
+        connection_window.deiconify()
+        connection_window.lift()
+        status.set("연결 정보를 확인한 뒤 ‘검사하고 참여 시작’을 누르세요."
+                   if variables["node"].get() and variables["token"].get()
+                   else "웹에서 페어링 코드를 발급받아 위에 입력하고 ‘서버에 바로 연결’을 누르세요.")
+        scan_connections(refresh=True)
+
+    def show_model_step():
+        if state["busy"] or worker.running or state["closing"]:
+            return
+        state["step"] = "model"
+        connection_window.withdraw()
+        root.deiconify()
+        root.lift()
+        status.set("모델 준비가 완료되었습니다. ‘다음: 연결 설정’을 누르세요."
+                   if state["contract"] else "실행기를 확인하고 ‘다음: 연결 설정’을 누르세요.")
 
     def lock(locked):
         for widget in editable:
             widget.configure(state="disabled" if locked else "normal")
         scan_button.configure(state="disabled" if locked else "normal")
-        start_button.configure(state="disabled" if locked else "normal")
         export_button.configure(state="normal" if state["contract"] and not locked else "disabled")
         stop_button.configure(state="normal" if worker.running and not state["stopping"] else "disabled")
         update_model_selection()
         update_connection_controls()
         update_runtime_controls()
+        update_navigation()
 
     def scan():
         try:
-            files = local_files(values("server", "model", "template"))
+            files = local_files(selected_files())
             context = integer(variables["context"].get(), "컨텍스트", 4096, 131072)
         except ValueError as exc:
+            state["open_pairing_after_scan"] = False
             messagebox.showerror("파일 선택 확인", str(exc), parent=root)
             return
         state["busy"] = True
@@ -939,30 +1242,38 @@ def gui_main(initial_config=None):
         def calculate():
             try:
                 contract = compute_contract(files, context)
-                match_contract(contract, state["expected"])
                 messages.put(("contract", contract))
             except Exception as exc:
                 messages.put(("error", str(exc)))
         threading.Thread(target=calculate, daemon=True).start()
 
+    def open_pairing():
+        if state["contract"]:
+            show_connection_step()
+        else:
+            state["open_pairing_after_scan"] = True
+            scan()
+
     def export():
-        path = filedialog.asksaveasfilename(title="모델 검증 파일 저장", initialfile="relay-model-contract.json", defaultextension=".json", filetypes=[("JSON", "*.json")])
+        parent = connection_window if state["step"] == "connection" else root
+        path = filedialog.asksaveasfilename(parent=parent, title="모델 검증 파일 저장", initialfile="relay-model-contract.json", defaultextension=".json", filetypes=[("JSON", "*.json")])
         if path:
             try:
                 Path(path).write_text(json.dumps(state["contract"], ensure_ascii=False, indent=2), encoding="utf-8")
-                status.set("모델 검증 파일을 저장했습니다. ‘웹 설정 열기’에서 모델 승인 → PC 등록 → 연결 설정 저장을 진행하세요.")
+                status.set("모델 검증 파일을 저장했습니다. ‘다음: 연결 설정’으로 이동하세요."
+                           if state["step"] == "model" else "모델 검증 파일을 저장했습니다. 웹의 GPU 등록 화면에 이 파일을 첨부하세요.")
             except OSError:
-                messagebox.showerror("저장 실패", "저장할 폴더와 파일 권한을 확인해 주세요.", parent=root)
+                messagebox.showerror("저장 실패", "저장할 폴더와 파일 권한을 확인해 주세요.", parent=parent)
 
     def start():
         try:
-            worker.start(connection(), values("server", "model", "template"), variables["port"].get(), variables["gpu_layers"].get())
+            worker.start(connection(), selected_files(), variables["port"].get(), variables["gpu_layers"].get())
             state["stopping"] = False
             status.set("파일 검증과 GPU 준비를 시작합니다…")
             remember_selection()
             lock(True)
         except (ValueError, OSError, RuntimeError) as exc:
-            messagebox.showerror("참여 시작 확인", str(exc), parent=root)
+            messagebox.showerror("참여 시작 확인", str(exc), parent=connection_window)
 
     def stop():
         state["stopping"] = True
@@ -970,25 +1281,50 @@ def gui_main(initial_config=None):
         lock(True)
         worker.stop()
 
-    scan_button = ttk.Button(actions, text="파일 검사", command=scan)
+    scan_button = ttk.Button(actions, name="scan_model", text="파일 검사", command=scan)
     scan_button.pack(side="left")
-    export_button = ttk.Button(actions, text="모델 검증 파일 저장", command=export, state="disabled")
+    export_button = ttk.Button(actions, name="export_contract", text="모델 검증 파일 저장", command=export, state="disabled")
     export_button.pack(side="left", padx=8)
-    stop_button = ttk.Button(actions, text="참여 중지", command=stop, state="disabled")
+    next_button = ttk.Button(actions, name="next_connection", text="다음: 연결 설정 →", command=open_pairing)
+    next_button.pack(side="right")
+    back_button = ttk.Button(connection_actions_footer, name="back_model", text="← 모델 준비", command=show_model_step)
+    back_button.pack(side="left")
+    connection_export_button = ttk.Button(connection_actions_footer, name="export_contract_connection", text="모델 검증 파일 저장", command=export, state="disabled")
+    connection_export_button.pack(side="left", padx=8)
+    stop_button = ttk.Button(connection_actions_footer, name="stop_participation", text="참여 중지", command=stop, state="disabled")
     stop_button.pack(side="right")
-    start_button = ttk.Button(actions, text="검사하고 참여 시작", command=start)
+    start_button = ttk.Button(connection_actions_footer, name="start_participation", text="검사하고 참여 시작", command=start, state="disabled")
     start_button.pack(side="right", padx=8)
     ttk.Label(body, text="실행 기록").grid(sticky="w", pady=(0, 6))
     log = ScrolledText(body, height=3, font=("Malgun Gothic", 9), relief="flat", state="disabled", wrap="word")
     log.grid(sticky="nsew")
     ttk.Label(body, text="이 창을 닫으면 참여와 모델 실행이 함께 종료됩니다.").grid(sticky="w", pady=(10, 0))
+    ttk.Label(connection_body, text="실행 기록").grid(row=6, column=0, sticky="w", pady=(0, 6))
+    connection_log = ScrolledText(connection_body, height=3, font=("Malgun Gothic", 9), relief="flat", state="disabled", wrap="word")
+    connection_log.grid(row=7, column=0, sticky="ew")
+    ttk.Label(connection_body, text="이 창을 닫으면 참여와 모델 실행이 함께 종료됩니다.").grid(row=8, column=0, sticky="w", pady=(10, 0))
 
     def invalidate(*_):
         state["contract"] = None
         export_button.configure(state="disabled")
+        update_navigation()
 
     for key in ("model", "server", "template", "context"):
         variables[key].trace_add("write", invalidate)
+
+    def update_rental_mode(*_):
+        if rental_only.get():
+            discovery_group.grid_remove()
+            for widget in model_file_widgets:
+                widget.grid_remove()
+        else:
+            discovery_group.grid()
+            for widget in model_file_widgets:
+                widget.grid()
+        invalidate()
+
+    rental_only.trace_add("write", update_rental_mode)
+    update_rental_mode()
 
     def manual_connection_changed(key, *_):
         if not state["importing"]:
@@ -996,18 +1332,22 @@ def gui_main(initial_config=None):
                 return
             state["connection_manual"] = True
             state["connection_file"] = ""
+            state["loaded_connection"] = None
+            state["connection_generation"] += 1
             connection_summary.set("수동 연결 정보 사용 중 · 참여 키는 저장되지 않아 다음 실행 때 다시 입력해야 합니다.")
+        update_navigation()
 
     for key in ("coordinator", "pool", "node", "token", "context"):
         variables[key].trace_add("write", lambda *args, field=key: manual_connection_changed(field, *args))
 
     def append_log(text):
-        log.configure(state="normal")
-        log.insert("end", text + "\n")
-        if int(log.index("end-1c").split(".")[0]) > 300:
-            log.delete("1.0", "100.0")
-        log.see("end")
-        log.configure(state="disabled")
+        for output in (log, connection_log):
+            output.configure(state="normal")
+            output.insert("end", text + "\n")
+            if int(output.index("end-1c").split(".")[0]) > 300:
+                output.delete("1.0", "100.0")
+            output.see("end")
+            output.configure(state="disabled")
 
     def receive():
         try:
@@ -1015,6 +1355,7 @@ def gui_main(initial_config=None):
                 kind, value = messages.get_nowait()
                 if kind == "restore-preferences":
                     preferences, notices, problem = value
+                    state["preferences_loaded"] = True
                     if problem:
                         state["preferences_restore_failed"] = True
                         state["connection_manual"] = True
@@ -1035,11 +1376,14 @@ def gui_main(initial_config=None):
                     for key in ("server", "model", "template"):
                         if key in preferences:
                             variables[key].set(preferences[key])
+                    rental_only.set(not bool(preferences.get("model")))
                     for notice in notices:
                         append_log(notice)
                     discover()
                     discover_runtimes()
                     previous_connection = initial_config or preferences.get("connection_file")
+                    if not previous_connection and paired_connection_path().is_file():
+                        previous_connection = str(paired_connection_path())
                     if previous_connection:
                         state["connection_file"] = str(Path(previous_connection).absolute())
                         state["connection_manual"] = True
@@ -1061,9 +1405,12 @@ def gui_main(initial_config=None):
                         status.set(problem)
                         append_log(problem)
                     lock(False)
+                    scan_connections()
                 elif kind == "connections":
                     generation, value = value
                     state["connection_scanning"] = False
+                    state["connection_active_refresh"] = False
+                    connection_refresh_button.configure(text="연결 다시 찾기")
                     if generation != state["connection_generation"]:
                         update_connection_controls()
                         scan_connections()
@@ -1080,6 +1427,10 @@ def gui_main(initial_config=None):
                               c["config"]["coordinator"] + " · " + Path(c["path"]).name for c in candidates]
                     connection_picker.configure(values=labels)
                     chosen = next((i for i, c in enumerate(candidates) if c["fingerprint"] == previous), -1)
+                    if chosen < 0 and state["connection_file"]:
+                        chosen = next((i for i, c in enumerate(candidates)
+                                       if (os.path.normcase(c["path"]) == os.path.normcase(state["connection_file"])
+                                           or c["config"] == state["loaded_connection"])), -1)
                     if chosen >= 0:
                         connection_picker.current(chosen)
                     else:
@@ -1100,13 +1451,20 @@ def gui_main(initial_config=None):
                         connection_search_status.set("현재 연결 정보를 유지합니다. 다른 연결을 쓰려면 목록에서 직접 선택하세요."
                                                      if candidates else "현재 연결 정보를 사용합니다. 새 다운로드도 자동으로 확인합니다.")
                     else:
-                        connection_search_status.set("새 연결 파일을 기다립니다. 웹에서 ‘연결 설정 저장’을 누르면 자동으로 감지합니다.")
+                        connection_search_status.set("새 연결 파일을 기다립니다. 웹에서 GPU를 등록한 뒤 ‘연결 설정 저장’을 누르면 자동으로 감지합니다.")
+                    if state["connection_scan_feedback"]:
+                        roots = " · ".join(value.get("roots", [])) or "확인한 폴더 없음"
+                        result_label = "검색 완료" if value.get("complete") else "검색 일부 완료"
+                        connection_search_status.set(f"{result_label} · 연결 {len(candidates)}개\n검색 폴더: {roots}\n"
+                                                     + connection_search_status.get())
                     warnings = tuple(value.get("warnings", [])[:3])
                     if warnings != state["connection_scan_warnings"]:
                         for warning in warnings:
                             append_log("연결 파일 탐색: " + warning)
                     state["connection_scan_warnings"] = warnings
                     update_connection_controls()
+                    if state["connection_refresh_requested"]:
+                        root.after(0, lambda: scan_connections(refresh=True))
                 elif kind == "runtimes":
                     state["runtime_searching"] = False
                     candidates = value.get("runtimes", [])
@@ -1173,11 +1531,28 @@ def gui_main(initial_config=None):
                 elif kind == "contract":
                     state["contract"] = value
                     state["busy"] = False
-                    status.set("파일 검사가 완료됐습니다. ‘검사하고 참여 시작’을 눌러 주세요."
-                               if variables["node"].get() and variables["token"].get()
-                               else "파일 검사가 완료됐습니다. ‘모델 검증 파일 저장’을 누른 뒤 웹에서 모델 승인과 PC 등록을 진행하세요.")
+                    status.set("파일 검사가 완료됐습니다. ‘다음: 연결 설정’에서 기존 연결을 사용하거나 새 PC를 연결하세요.")
                     lock(False)
+                    if state["open_pairing_after_scan"]:
+                        state["open_pairing_after_scan"] = False
+                        root.after(0, show_connection_step)
                 elif kind == "error":
+                    state["busy"] = False
+                    state["open_pairing_after_scan"] = False
+                    status.set(value)
+                    append_log(value)
+                    lock(False)
+                elif kind == "paired":
+                    config, path, notice = value
+                    state["busy"] = False
+                    apply_connection(config, path)
+                    state["pair_request"] = None
+                    variables["pair_code"].set("")
+                    status.set(notice or "PC가 등록되었습니다. GPU 제공을 시작하려면 ‘검사하고 참여 시작’을 누르세요.")
+                    if notice:
+                        append_log(notice)
+                    lock(False)
+                elif kind == "pair-error":
                     state["busy"] = False
                     status.set(value)
                     append_log(value)
@@ -1231,6 +1606,7 @@ def gui_main(initial_config=None):
         threading.Thread(target=restore, daemon=True).start()
 
     root.protocol("WM_DELETE_WINDOW", close)
+    connection_window.protocol("WM_DELETE_WINDOW", close)
     root.after(120, receive)
     root.after(50, restore_selection)
     root.after(400, watch_connections)

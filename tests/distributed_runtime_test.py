@@ -6,11 +6,13 @@ import struct
 from bisect import bisect_right
 import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 spec = importlib.util.spec_from_file_location("provider.distributed_runtime", Path(__file__).parents[1] / "provider" / "distributed_runtime.py")
 module = importlib.util.module_from_spec(spec)
@@ -258,6 +260,92 @@ class DistributedRuntimeTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "no automatic"):
                         runtime.run()
             self.assertIsNone(runtime.process)
+
+    def test_reporting_checks_origin_credentials_and_only_local_gpu_ids_before_spawn(self):
+        for origin in ("http://example.com", "https://user:password@example.com", "https://example.com/path",
+                       "https://example.com/?key=secret", "https://example.com:0", "https://example.com\\evil"):
+            with self.subTest(origin=origin), patch.dict(module.os.environ, {"RELAY_INFERENCE_PROVIDER_TOKEN": "k" * 32}):
+                with self.assertRaises(ValueError):
+                    self.runtime([*self.server, "--coordinator", origin, "--gpu-id", "local"])
+        with patch.dict(module.os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, "PROVIDER_TOKEN"):
+            self.runtime([*self.server, "--coordinator", "https://relay.example", "--gpu-id", "local"])
+        with patch.dict(module.os.environ, {"RELAY_INFERENCE_PROVIDER_TOKEN": "k" * 32}):
+            for ids in ([], ["remote"], ["local", "remote"], ["local", "local"]):
+                options = [item for gpu_id in ids for item in ("--gpu-id", gpu_id)]
+                with self.subTest(ids=ids), self.assertRaises(ValueError):
+                    self.runtime([*self.server, "--coordinator", "https://relay.example", *options])
+
+    def test_reclaim_finishes_while_coordinator_is_blocked_and_reports_in_order(self):
+        entered, unblock = threading.Event(), threading.Event()
+        reported = []
+        transports = []
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        with patch.dict(module.os.environ, {"RELAY_INFERENCE_PROVIDER_TOKEN": "k" * 32}):
+            runtime = self.runtime([*self.server, "--coordinator", "https://relay.example", "--gpu-id", "local"])
+            def response(url, payload=None, token=None, **kwargs):
+                if url.startswith("https://"):
+                    reported.append(payload)
+                    transports.append((token, kwargs["timeout"]))
+                    if payload["state"] == "providing":
+                        entered.set()
+                        unblock.wait(timeout=5)
+                        raise URLError("coordinator offline")
+                    return {"ok": True}
+                return self.props(runtime) if url.endswith("/props") else {}
+            try:
+                with patch.object(module.socket, "socket"), patch.object(module, "request_json", side_effect=response), \
+                        patch.object(module.subprocess, "Popen", return_value=process) as popen:
+                    runtime.start()
+                    self.assertTrue(entered.wait(timeout=2))
+                    runtime.request_stop()
+                    self.assertEqual(runtime.state, "released")
+                    self.assertIsNone(runtime.process)
+                    process.terminate.assert_called_once()
+                    process.wait.assert_called_once()
+                    self.assertFalse(unblock.is_set())
+                    self.assertNotIn("RELAY_INFERENCE_PROVIDER_TOKEN", popen.call_args.kwargs["env"])
+                    unblock.set()
+                    runtime._notifications.put(None)
+                    runtime._notifier.join(timeout=2)
+            finally:
+                unblock.set()
+                if runtime._notifier.is_alive():
+                    runtime._notifications.put(None)
+                    runtime._notifier.join(timeout=2)
+        self.assertEqual([entry["state"] for entry in reported], ["providing", "reclaiming", "released"])
+        self.assertEqual(transports, [("k" * 32, 2)] * 3)
+        self.assertTrue(all(entry["runtimeId"] == runtime.runtime_id and entry["startedAt"] == runtime.started_at
+                            and entry["groupId"] == "large" and entry["gpuIds"] == ["local"] for entry in reported))
+
+    def test_failed_owned_process_exit_never_reports_return_complete(self):
+        runtime = self.runtime()
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("owned", 5)
+        runtime.process = process
+        with self.assertRaises(subprocess.TimeoutExpired):
+            runtime.request_stop()
+        self.assertEqual(runtime.state, "reclaiming")
+        self.assertIs(runtime.process, process)
+        process.kill.assert_called_once()
+        process.wait.side_effect = None
+        runtime.stop_runtime()
+        self.assertEqual(runtime.state, "released")
+
+    def test_stop_confirms_real_owned_process_exit_without_a_gpu(self):
+        runtime = self.runtime()
+        def response(url, **kwargs):
+            return self.props(runtime) if url.endswith("/props") else {}
+        with patch.object(module.socket, "socket"), patch.object(module, "request_json", side_effect=response), \
+                patch.object(runtime, "command", return_value=[sys.executable, "-c", "import time; time.sleep(30)"]):
+            runtime.start()
+        process = runtime.process
+        self.assertIsNone(process.poll())
+        runtime.request_stop()
+        self.assertIsNotNone(process.poll())
+        self.assertEqual(runtime.state, "released")
 
 
 if __name__ == "__main__":

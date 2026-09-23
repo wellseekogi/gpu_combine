@@ -86,6 +86,85 @@ class ConnectionDiscoveryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(len(result["connections"]), 1)
 
+    def test_known_file_can_have_any_name_without_scanning_its_parent(self):
+        selected = self.file("my-connection.json", folder=self.root / "selected")
+        self.file("relay-provider-other.json", {**self.config, "node": "other-node"}, folder=selected.parent)
+        calls = []
+        def reader(path):
+            calls.append(path)
+            return read_connection(path)
+        result = self.scan(reader, known_paths=selected)
+        self.assertTrue(result["complete"])
+        self.assertEqual(calls, [selected])
+        self.assertEqual(result["connections"][0]["path"], str(selected))
+        self.assertEqual(result["roots"], [str(self.root)])
+
+    def test_known_file_is_read_once_when_repeated_or_in_a_search_root(self):
+        selected = self.file()
+        calls = []
+        def reader(path):
+            calls.append(path)
+            return read_connection(path)
+        result = self.scan(reader, known_paths=[str(selected), selected], max_candidates=1)
+        self.assertTrue(result["complete"])
+        self.assertEqual(calls, [selected])
+        self.assertEqual(len(result["connections"]), 1)
+
+    def test_known_files_precede_roots_and_share_the_candidate_limit(self):
+        selected = self.file("saved-connection.json", folder=self.root / "selected")
+        self.file(config={**self.config, "node": "other-node"})
+        result = self.scan(known_paths=[selected], max_candidates=1)
+        self.assertFalse(result["complete"])
+        self.assertEqual(len(result["connections"]), 1)
+        self.assertEqual(result["connections"][0]["path"], str(selected))
+
+    def test_known_file_config_is_deduplicated_with_downloaded_copy(self):
+        selected = self.file("saved-connection.json", folder=self.root / "selected")
+        self.file()
+        result = self.scan(known_paths=[selected])
+        self.assertTrue(result["complete"])
+        self.assertEqual(len(result["connections"]), 1)
+        self.assertEqual(result["connections"][0]["config"], self.config)
+
+    def test_missing_known_file_warns_without_blocking_current_downloads(self):
+        self.file()
+        result = self.scan(known_paths=[self.root / "old-connection.json"])
+        self.assertTrue(result["complete"])
+        self.assertEqual(len(result["connections"]), 1)
+        self.assertTrue(result["warnings"])
+
+    def test_known_files_keep_size_and_validation_limits(self):
+        selected = self.root / "big-saved-connection.json"
+        selected.write_bytes(b"x" * (module.MAX_CONFIG_BYTES + 1))
+        malformed = self.root / "broken-saved-connection.json"
+        malformed.write_text("invalid json")
+        calls = []
+        def reader(path):
+            calls.append(path)
+            return read_connection(path)
+        result = self.scan(reader, known_paths=[selected, malformed])
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["connections"], [])
+        self.assertEqual(calls, [malformed])
+        self.assertTrue(result["warnings"])
+
+    def test_disappearing_known_file_during_validation_is_incomplete(self):
+        selected = self.file("saved-connection.json")
+        def removed(path):
+            config = read_connection(path)
+            path.unlink()
+            return config
+        result = self.scan(removed, known_paths=[selected])
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["connections"], [])
+
+    def test_known_file_count_is_bounded_even_for_iterators(self):
+        def unending_paths():
+            while True:
+                yield self.root / "saved-connection.json"
+        with self.assertRaises(ValueError):
+            self.scan(known_paths=unending_paths())
+
     def test_oversized_and_malformed_files_are_skipped_without_callback_for_oversize(self):
         self.file()
         (self.root / "relay-provider-big.json").write_bytes(b"x" * (module.MAX_CONFIG_BYTES + 1))
@@ -107,11 +186,13 @@ class ConnectionDiscoveryTests(unittest.TestCase):
             link.symlink_to(original)
         except OSError:
             self.skipTest("OS does not permit symbolic links")
-        calls = []
-        result = self.scan(lambda path: calls.append(path))
-        self.assertEqual(calls, [])
-        self.assertEqual(result["connections"], [])
-        self.assertTrue(result["complete"])
+        for options in ({}, {"known_paths": [link]}):
+            with self.subTest(options=options):
+                calls = []
+                result = self.scan(lambda path: calls.append(path), **options)
+                self.assertEqual(calls, [])
+                self.assertEqual(result["connections"], [])
+                self.assertTrue(result["complete"])
 
     def test_config_fields_are_validated_not_used_as_local_paths(self):
         self.file(config={**self.config, "server": "do-not-run.exe", "model": "arbitrary-path"})
@@ -215,6 +296,31 @@ class ConnectionDiscoveryTests(unittest.TestCase):
             self.assertEqual(result["connections"], [])
         finally:
             release.set()
+
+    def test_known_file_timeout_and_cancellation_return_partial(self):
+        selected = self.file("saved-connection.json")
+        release = threading.Event()
+        entered = threading.Event()
+        def blocked(_path):
+            entered.set()
+            release.wait(2)
+            return self.config
+        try:
+            started = time.monotonic()
+            result = self.scan(blocked, known_paths=[selected], max_seconds=0.05)
+            self.assertTrue(entered.is_set())
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertFalse(result["complete"])
+            self.assertEqual(result["connections"], [])
+        finally:
+            release.set()
+        cancelled = threading.Event()
+        cancelled.set()
+        calls = []
+        result = self.scan(lambda path: calls.append(path), known_paths=[selected], cancel_event=cancelled)
+        self.assertEqual(calls, [])
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["connections"], [])
 
     def test_pre_cancelled_search_is_incomplete(self):
         event = threading.Event()

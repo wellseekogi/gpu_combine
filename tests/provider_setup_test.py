@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location("provider_setup", Path(__file__).parents[1] / "provider" / "setup_gui.py")
@@ -29,6 +30,66 @@ class SetupTests(unittest.TestCase):
             self.files[key] = str(path)
         self.connection = {"coordinator": "http://127.0.0.1:8788", "pool": "pool-1", "node": "node-1",
                            "token": "secret-sentinel-never-log", "context": 8192}
+
+    def test_gpu_only_contract_requires_no_model_or_template_files(self):
+        files = {"server": self.files["server"], "rental_only": True}
+        contract = setup.compute_contract(files, 8192)
+        self.assertEqual(contract["modelDigest"], "0" * 64)
+        self.assertEqual(contract["template"], "0" * 64)
+        self.assertEqual(contract["runtime"], setup.runtime.digest_file(self.files["server"]))
+        self.assertTrue(contract["runtimeOnly"])
+        config = setup.connection_config({**self.connection, "model": contract})
+        self.assertEqual(config["model"]["modelDigest"], "0" * 64)
+        worker = setup.runtime.Provider(type("Args", (), {**files, "context":8192, "port":8081})())
+        self.assertEqual(worker.capabilities(), ["renter-model", "rental-session"])
+        with patch.object(worker, "start_runtime") as start:
+            with self.assertRaisesRegex(RuntimeError, "requires a renter-uploaded model"):
+                worker.execute_task({"kind":"chat"})
+        start.assert_not_called()
+
+    def test_pairing_sends_checked_contract_and_keeps_gpu_stopped(self):
+        contract = setup.compute_contract({"server": self.files["server"], "rental_only": True}, 8192)
+        request = {"requestId": str(uuid.uuid4()), "token": str(uuid.uuid4()) + str(uuid.uuid4())}
+        response = {"config": {"version": 1, "coordinator": "https://relay.example", "pool": "local-owner",
+                               "node": "paired-node", "nodeName": "내 PC", "token": request["token"],
+                               "context": 8192, "model": contract}}
+        with patch.object(setup.runtime, "request_json", return_value=response) as post:
+            config = setup.pair_device("https://relay.example/", "ABC-123", "내 PC", "GPU 실행 환경",
+                                       contract, 8192, request)
+        self.assertEqual(config["token"], request["token"])
+        self.assertEqual(post.call_args.args[0], "https://relay.example/api/participation/pair")
+        self.assertEqual(post.call_args.args[1], {"code": "ABC-123", **request, "name": "내 PC",
+                                                 "modelName": "GPU 실행 환경", "model": contract, "vram": 8192})
+        self.assertEqual(post.call_args.kwargs, {"timeout": 12})
+
+    def test_pairing_rejects_unsafe_server_and_mismatched_response(self):
+        contract = setup.compute_contract({"server": self.files["server"], "rental_only": True}, 8192)
+        request = {"requestId": str(uuid.uuid4()), "token": str(uuid.uuid4()) + str(uuid.uuid4())}
+        with patch.object(setup.runtime, "request_json") as post:
+            with self.assertRaises(ValueError):
+                setup.pair_device("http://remote.example", "ABC", "PC", "GPU 실행 환경", contract, 8192, request)
+            post.assert_not_called()
+        response = {"config": {"coordinator": "https://relay.example", "pool": "local-owner", "node": "node",
+                               "nodeName": "PC", "token": str(uuid.uuid4()) + str(uuid.uuid4()),
+                               "context": 8192, "model": contract}}
+        with patch.object(setup.runtime, "request_json", return_value=response):
+            with self.assertRaisesRegex(ValueError, "연결 응답"):
+                setup.pair_device("https://relay.example", "ABC", "PC", "GPU 실행 환경", contract, 8192, request)
+
+    def test_paired_connection_is_private_and_preferences_keep_only_path(self):
+        contract = setup.compute_contract({"server": self.files["server"], "rental_only": True}, 8192)
+        config = {"coordinator": "https://relay.example", "pool": "local-owner", "node": "node",
+                  "nodeName": "PC", "token": str(uuid.uuid4()) + str(uuid.uuid4()),
+                  "context": 8192, "model": contract}
+        path = Path(self.temp.name) / "Relay" / "provider-connection.json"
+        saved = setup.save_paired_connection(config, path)
+        self.assertEqual(setup.read_connection(saved)["token"], config["token"])
+        if os.name != "nt":
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        preferences = Path(self.temp.name) / "provider-setup.json"
+        setup.save_preferences({"connection_file": saved, "token": config["token"]}, preferences)
+        self.assertNotIn(config["token"], preferences.read_text(encoding="utf-8"))
 
     def test_connection_import_ignores_executable_paths(self):
         config = setup.connection_config({**self.connection, "server": "malicious.exe", "files": {"model": "other.gguf"}})
@@ -62,6 +123,26 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(setup.web_console_url("http://127.0.0.1:8788"), "http://127.0.0.1:8788/#connect-pc")
         self.assertEqual(setup.web_console_url("http://[::1]:8788/"), "http://[::1]:8788/#connect-pc")
         self.assertEqual(setup.web_console_url("https://relay.example/api"), "https://relay.example/#connect-pc")
+
+    def test_downloaded_helper_uses_its_service_configuration(self):
+        path = Path(self.temp.name) / "service-config.json"
+        with patch.dict(os.environ, {"RELAY_SERVICE_ORIGIN": ""}):
+            self.assertEqual(setup.default_coordinator(path), "http://127.0.0.1:8788")
+            path.write_text(json.dumps({"coordinator": "https://relay.example/"}), encoding="utf-8-sig")
+            self.assertEqual(setup.default_coordinator(path), "https://relay.example")
+            for payload in ([], {}, {"coordinator": "http://remote.example"}, {"coordinator": "https://user:secret@relay.example"}):
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                self.assertEqual(setup.default_coordinator(path), "http://127.0.0.1:8788")
+            path.write_bytes(b" " * (setup.MAX_CONFIG_BYTES + 1))
+            self.assertEqual(setup.default_coordinator(path), "http://127.0.0.1:8788")
+
+    def test_cached_helper_uses_validated_original_service_origin(self):
+        path = Path(self.temp.name) / "service-config.json"
+        path.write_text(json.dumps({"coordinator": "https://bundle.example"}), encoding="utf-8")
+        with patch.dict(os.environ, {"RELAY_SERVICE_ORIGIN": "https://original.example/"}):
+            self.assertEqual(setup.default_coordinator(path), "https://original.example")
+        with patch.dict(os.environ, {"RELAY_SERVICE_ORIGIN": "javascript:alert(1)"}):
+            self.assertEqual(setup.default_coordinator(path), "https://bundle.example")
 
     def test_web_setup_rejects_unsafe_addresses_and_credentials(self):
         for address in ("http://relay.example", "file:///relay", "javascript:alert(1)",
