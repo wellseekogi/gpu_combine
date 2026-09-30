@@ -1,4 +1,5 @@
 import {spawn} from "node:child_process";import{randomBytes}from"node:crypto";import assert from"node:assert/strict";import{fixture}from"../lib/relay/engine.mjs";
+import {rm} from "node:fs/promises";
 const token=randomBytes(32).toString("hex"),base="http://127.0.0.1:8792";let cookie="",proc,log="";
 const env={...process.env,RELAY_ADMIN_TOKEN:token,RELAY_PORT:"8792",RELAY_DATA_DIR:"work/http-qa-"+Date.now()};
 async function boot(){proc=spawn(process.execPath,["standalone/server.mjs"],{env,stdio:"pipe",windowsHide:true});proc.stderr.on("data",d=>log+=d);for(let i=0;i<100;i++){try{if((await fetch(base)).ok)return;}catch{}await new Promise(r=>setTimeout(r,50));}throw Error("Server startup failed "+log)}
@@ -36,5 +37,5 @@ try{
  const restored=(await req("/api/relay")).body.state;assert.equal(restored.books.live.jobs[0].spent,10);checks++;
  await action("revoke",{nodeId:n.nodeId});assert.equal((await worker("status")).r.status,401);checks++;
  console.log(JSON.stringify({pass:true,checks,scope:"HTTP authentication, authorization, source checks, provider protocol, atomic settlement, idempotency, restart durability; synthetic responses only"}));
-}catch(e){console.error(e);console.error(log);process.exitCode=1;}finally{if(proc?.exitCode===null)await stop();}
+}catch(e){console.error(e);console.error(log);process.exitCode=1;}finally{if(proc?.exitCode===null)await stop();await rm(env.RELAY_DATA_DIR,{recursive:true,force:true});}
 

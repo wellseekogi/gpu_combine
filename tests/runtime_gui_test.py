@@ -181,6 +181,78 @@ class RuntimeGUITests(unittest.TestCase):
             self.assertTrue(self.widget("runtime_candidates").instate(["readonly"]))
         self.run_gui(scenario, candidates=[candidate])
 
+    def test_model_validation_opens_separate_connection_window_and_back_preserves_files(self):
+        candidate = self.runtime_candidate()
+        model = self.directory / "prepared.gguf"
+        model.write_bytes(b"GGUF local wizard fixture")
+        template = self.directory / "chat.jinja"
+        template.write_text("{{ messages }}", encoding="utf-8")
+        export = self.directory / "relay-model-contract.json"
+
+        def scenario():
+            yield self.scan_finished
+            self.widget("rental_only").invoke()
+            connection_window = self.widget("connection_window")
+            connection_window.attributes("-alpha", 0)
+            self.root.deiconify()
+            self.assertEqual(connection_window.state(), "withdrawn")
+            self.assertEqual(self.widget("model_setup").winfo_toplevel(), self.root)
+            self.assertEqual(self.widget("connection_setup").winfo_toplevel(), connection_window)
+            self.assertEqual(self.widget("start_participation").winfo_toplevel(), connection_window)
+            self.assertFalse(self.widget("next_connection").instate(["disabled"]))
+            self.assertEqual(connection_window.state(), "withdrawn")
+            self.widget("setting_model").insert(0, str(model))
+            self.widget("setting_template").insert(0, str(template))
+            self.widget("scan_model").invoke()
+            yield lambda: not self.widget("next_connection").instate(["disabled"])
+            with patch("tkinter.filedialog.asksaveasfilename", return_value=str(export)):
+                self.widget("export_contract").invoke()
+            self.assertEqual(json.loads(export.read_text(encoding="utf-8"))["modelDigest"], setup.runtime.digest_file(str(model)))
+            self.widget("next_connection").invoke()
+            self.assertEqual(self.root.state(), "withdrawn")
+            self.assertEqual(connection_window.state(), "normal")
+            self.assertTrue(self.widget("start_participation").instate(["disabled"]), "Starting requires connection credentials")
+            connection_file = self.directory / "downloaded-connection.json"
+            connection_file.write_text(json.dumps({"coordinator": "https://relay.example", "pool": "test-pool",
+                                                  "node": "test-node", "token": "test-token", "context": 8192,
+                                                  "model": json.loads(export.read_text(encoding="utf-8"))}), encoding="utf-8")
+            with patch("tkinter.filedialog.askopenfilename", return_value=str(connection_file)):
+                self.widget("import_connection").invoke()
+            yield lambda: self.widget("setting_node").get() == "test-node"
+            self.assertFalse(self.widget("start_participation").instate(["disabled"]))
+            self.widget("back_model").invoke()
+            self.assertEqual(connection_window.state(), "withdrawn")
+            self.assertEqual(self.root.state(), "normal")
+            self.assertEqual(self.widget("setting_model").get(), str(model))
+            self.assertFalse(self.widget("next_connection").instate(["disabled"]))
+            self.widget("setting_template").insert("end", ".changed")
+            self.assertFalse(self.widget("next_connection").instate(["disabled"]), "The button rescans changed files")
+            self.assertTrue(self.widget("export_contract").instate(["disabled"]))
+
+        self.run_gui(scenario, candidates=[candidate])
+
+    def test_fresh_provider_registers_gpu_with_only_runtime_and_no_local_model(self):
+        candidate = self.runtime_candidate()
+        export = self.directory / "relay-runtime-contract.json"
+
+        def scenario():
+            yield self.scan_finished
+            self.assertTrue(bool(self.root.getvar(self.widget("rental_only").cget("variable"))))
+            self.assertEqual(self.widget("setting_model").get(), "")
+            self.assertEqual(self.widget("setting_template").get(), "")
+            self.assertFalse(self.widget("model_setup").winfo_manager())
+            self.widget("scan_model").invoke()
+            yield lambda: not self.widget("next_connection").instate(["disabled"])
+            with patch("tkinter.filedialog.asksaveasfilename", return_value=str(export)):
+                self.widget("export_contract").invoke()
+            contract = json.loads(export.read_text(encoding="utf-8"))
+            self.assertTrue(contract["runtimeOnly"])
+            self.assertEqual(contract["modelDigest"], "0" * 64)
+            self.assertEqual(contract["template"], "0" * 64)
+            self.assertEqual(contract["runtime"], setup.runtime.digest_file(candidate["path"]))
+
+        self.run_gui(scenario, candidates=[candidate])
+
     def test_multiple_runtimes_can_be_chosen_from_list_without_file_dialog(self):
         candidates = [self.runtime_candidate("cpu"), self.runtime_candidate("cuda")]
 

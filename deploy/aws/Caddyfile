@@ -1,0 +1,36 @@
+{
+    admin off
+    servers {
+        timeouts {
+            read_header 10s
+            read_body 1h
+            idle 60s
+        }
+        max_header_size 16KB
+    }
+}
+
+{$RELAY_DOMAIN} {
+    # Compress public versioned assets; keep token streams immediately flushable.
+    encode /assets/* zstd gzip
+    @modelUpload {
+        method POST
+        path /api/member/models
+    }
+    @standardRequest {
+        not path /api/member/models
+    }
+    request_body @modelUpload {
+        max_size 21474836480
+    }
+    request_body @standardRequest {
+        max_size 90000
+    }
+    reverse_proxy relay:8788 {
+        # Always replace client-supplied values with the immediate peer address.
+        header_up X-Real-IP {remote_host}
+        header_up -Forwarded
+        header_up -X-Forwarded-For
+        flush_interval -1
+    }
+}

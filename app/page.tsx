@@ -21,9 +21,8 @@ import {
   BookOpen,
   Upload,
   X,
-  KeyRound,
   Activity,
-  Archive,
+  Trash2,
   Server,
   Monitor,
   LogOut,
@@ -75,7 +74,18 @@ import {
   AlertDialogAction,
 } from "@/components/ui/alert-dialog";
 import { Toaster, toast } from "sonner";
+import SetupGuide from "./setup-guide";
+import InferencePanel from "./inference-panel";
+import ServiceHome from "./service-home";
+import ParticipantPanel, { MemberAllocations } from "./participant-panel";
+import { connectionConfig, parseModelContract } from "@/lib/relay/setup.mjs";
 type Any = any;
+type Submission = { fingerprint: string; requestId: string };
+function submissionId(ref: { current: Submission | null }, mode: string, action: string, payload: Any) {
+  const fingerprint = JSON.stringify({ mode, action, payload });
+  if (ref.current?.fingerprint !== fingerprint) ref.current = { fingerprint, requestId: crypto.randomUUID() };
+  return ref.current.requestId;
+}
 const labels: Record<string, string> = {
   queued: "대기 중",
   running: "실행 중",
@@ -90,8 +100,11 @@ const labels: Record<string, string> = {
   pending: "검증 대기",
 };
 const nav = [
+  ["LLM 실행", Play],
+  ["시작하기", Play],
   ["워크스페이스", LayoutDashboard],
   ["작업", ListTodo],
+  ["분산 LLM", Server],
   ["GPU 노드", Cpu],
   ["크레딧 원장", Wallet],
   ["설계와 운영", BookOpen],
@@ -221,15 +234,25 @@ function exportJob(j: Any, format: string) {
 function WorkspaceNavigation({
   section,
   onChange,
+  onProvide,
+  operator,
 }: {
   section: string;
   onChange: (label: string) => void;
+  onProvide: () => void;
+  operator: boolean;
 }) {
   const { setOpenMobile } = useSidebar();
   return (
     <nav aria-label="주요 메뉴">
       <SidebarMenu>
-        {nav.map(([label, Icon]) => (
+        <SidebarMenuItem><SidebarMenuButton isActive={section === "LLM 실행"} aria-current={section === "LLM 실행" ? "page" : undefined} size="lg" onClick={() => { onChange("LLM 실행"); setOpenMobile(false); }}><Play /><span>LLM 실행</span></SidebarMenuButton></SidebarMenuItem>
+        <SidebarMenuItem><SidebarMenuButton size="lg" onClick={() => { onProvide(); setOpenMobile(false); }}><Cpu /><span>GPU 제공</span></SidebarMenuButton></SidebarMenuItem>
+      </SidebarMenu>
+      <details className="operator-navigation" open={operator}>
+        <summary>운영자 도구</summary>
+        <SidebarMenu>
+        {nav.filter(([label]) => label !== "LLM 실행").map(([label, Icon]) => (
           <SidebarMenuItem key={label}>
             <SidebarMenuButton
               isActive={section === label}
@@ -245,14 +268,15 @@ function WorkspaceNavigation({
             </SidebarMenuButton>
           </SidebarMenuItem>
         ))}
-      </SidebarMenu>
+        </SidebarMenu>
+      </details>
     </nav>
   );
 }
 export default function Home() {
   const [data, setData] = useState<Any>(null),
-    [mode, setMode] = useState("demo"),
-    [section, setSection] = useState("워크스페이스"),
+    [mode, setMode] = useState("live"),
+    [section, setSection] = useState("LLM 실행"),
     [error, setError] = useState(""),
     [auth, setAuth] = useState(false),
     [busy, setBusy] = useState(false),
@@ -272,6 +296,22 @@ export default function Home() {
     [modelId, setModelId] = useState(""),
     [allowed, setAllowed] = useState<string[]>([]),
     [adminToken, setAdminToken] = useState("");
+  const [contractFile, setContractFile] = useState(""),
+    [manualModel, setManualModel] = useState(false),
+    [setupDownloading, setSetupDownloading] = useState(false),
+    [creatingNode, setCreatingNode] = useState(false),
+    [credentialSaved, setCredentialSaved] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [connection, setConnection] = useState<"checking" | "connected" | "disconnected">("checking");
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
+  const [memberTab, setMemberTab] = useState<"provide" | "use" | "history">("provide");
+  const pairing = useRef(false), contractInput = useRef<HTMLInputElement>(null), connectionFlow = useRef(false);
+  // Keep uncertain submissions in memory until acknowledged, edited, or explicitly reset.
+  const creatingJob = useRef(false);
+  const jobSubmission = useRef<Submission | null>(null);
+  const modelSubmission = useRef<Submission | null>(null);
+  const nodeSubmission = useRef<Submission | null>(null);
+  const nodeCredential = useRef<{ fingerprint: string; token: string } | null>(null);
   const [modelForm, setModelForm] = useState({
       name: "",
       digest: "",
@@ -304,18 +344,22 @@ export default function Home() {
     invalidateReads();
     refreshAfterMutation.current = false;
     setData(null);
+    setLastUpdated(null);
     setAuth(true);
     setError("");
     setSelected(null);
     setCredential(null);
-    setModal(null);
+    jobSubmission.current = modelSubmission.current = nodeSubmission.current = null;
+    nodeCredential.current = null;
+    setModal((current) => current === "connection" || connectionFlow.current ? "connection" : null);
     setNewOpen(false);
     setConfirm(null);
     setAdminToken("");
     setBusy(false);
   }, [invalidateReads]);
-  const load = useCallback(async () => {
+  const load = useCallback(async (reconnecting = false) => {
     if ((mutationSession.current === sessionEpoch.current && mutations.current > 0) || signingOut.current) return;
+    if (reconnecting) setConnection("checking");
     activeRead.current?.abort();
     const controller = new AbortController();
     activeRead.current = controller;
@@ -335,22 +379,28 @@ export default function Home() {
       if (!current()) return;
       if (!r.ok) {
         if (r.status === 401) {
+          setConnection("connected");
           clearAuthentication();
           return;
         }
         throw Error(d.error ?? "연결 실패");
       }
       setData(d);
+      setConnection("connected");
+      setLastUpdated(Date.now());
       setError("");
       setAuth(false);
     } catch (e: Any) {
-      if (current()) setError(e.message);
+      if (current()) {
+        setConnection("disconnected");
+        setError(e instanceof TypeError ? "서버에 연결할 수 없습니다. 서버 실행 상태와 네트워크를 확인하세요." : e.message);
+      }
     } finally {
       if (activeRead.current === controller) activeRead.current = null;
     }
   }, [clearAuthentication]);
   const act = useCallback(
-    async (action: string, payload: Any = {}, quiet = false) => {
+    async (action: string, payload: Any = {}, quiet = false, requestId: string = crypto.randomUUID()) => {
       if (signingOut.current) throw new DOMException("로그아웃 중입니다.", "AbortError");
       invalidateReads();
       const epoch = viewEpoch.current;
@@ -374,7 +424,7 @@ export default function Home() {
             mode: modeRef.current,
             action,
             payload,
-            requestId: crypto.randomUUID(),
+            requestId,
           }),
         });
         const d: Any = await r.json();
@@ -388,13 +438,17 @@ export default function Home() {
         refreshAfterMutation.current = true;
         if (epoch === viewEpoch.current) {
           setData(d);
+          setConnection("connected");
+          setLastUpdated(Date.now());
           setError("");
         }
         return d.result;
       } catch (e: Any) {
         if (e.name !== "AbortError" && session === sessionEpoch.current) {
-          setError(e.message);
-          if (!quiet) toast.error(e.message);
+          const message = e instanceof TypeError ? "서버에 연결할 수 없습니다. 연결 후 다시 시도하세요." : e.message;
+          if (e instanceof TypeError) setConnection("disconnected");
+          setError(message);
+          if (!quiet) toast.error(message);
         }
         throw e;
       } finally {
@@ -420,12 +474,67 @@ export default function Home() {
     try {
       await act(a, p);
       if (message) toast.success(message);
+      return true;
     } catch {
       /* Errors are already shown by the action handler. */
+      return false;
     }
   };
+  const openConnectionSetup = useCallback(() => {
+    connectionFlow.current = true;
+    setMemberTab("provide");
+    setMode("live");
+    setSection("LLM 실행");
+    setSelected(null);
+    setSearch("");
+    setModal("connection");
+    // Keep the destination shareable without a second hash event reopening it.
+    if (window.location.hash !== "#connect-pc") {
+      window.history.pushState(null, "", window.location.pathname + window.location.search + "#connect-pc");
+    }
+  }, []);
+  const openLlm = useCallback(() => {
+    connectionFlow.current = true;
+    setMemberTab("use");
+    setMode("live");
+    setSection("LLM 실행");
+    setSelected(null);
+    setModal("connection");
+    if (window.location.hash !== "#run-llm") window.history.pushState(null, "", window.location.pathname + window.location.search + "#run-llm");
+  }, []);
   useEffect(() => {
-    void load();
+    const onHashChange = () => {
+      if (window.location.hash === "#connect-pc") openConnectionSetup();
+      else if (window.location.hash === "#run-llm") openLlm();
+      else {
+        connectionFlow.current = false;
+        setModal(current => current === "connection" ? null : current);
+      }
+    };
+    onHashChange();
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, [openConnectionSetup, openLlm]);
+  useEffect(() => {
+    const token = new URLSearchParams(window.location.hash.slice(1)).get("setup-token");
+    if (token) {
+      // Remove the one-use launch credential from browser history before any API call.
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      void (async () => {
+        try {
+          const response = await fetch("/api/launch-login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token }),
+          });
+          if (!response.ok) throw Error("자동 연결 시간이 지났거나 이미 사용한 링크입니다. 관리자 키로 로그인하거나, 기존 Relay 실행 창을 닫은 뒤 START-RELAY.cmd를 다시 여세요.");
+          await load();
+        } catch (e: Any) {
+          setAuth(true);
+          setError(e.message);
+        }
+      })();
+    } else void load();
     return () => invalidateReads();
   }, [invalidateReads, load]);
   useEffect(() => {
@@ -447,11 +556,18 @@ export default function Home() {
     return () => clearInterval(timer);
   }, [data, auth, load]);
   const b = data?.state.books[mode],
-    jobs = (b?.jobs ?? []).filter((j: Any) => !j.archived),
+    jobs = (b?.jobs ?? []).filter((j: Any) => !j.archived && j.kind !== "chat"),
     nodes = b?.nodes ?? [],
     models = b?.models ?? [],
     job = b?.jobs.find((j: Any) => j.id === selected);
   const openNew = (sample = false) => {
+    if (creatingJob.current) return;
+    if (!sample && mode === "live" && !models.length) {
+      setSection("시작하기");
+      toast.info("작업을 만들기 전에 사용할 모델을 준비하세요.");
+      return;
+    }
+    jobSubmission.current = null;
     setTitle(sample ? "공개 기술 문서 비교" : "");
     setDocuments(sample ? samples.map((d) => ({ ...d })) : [emptyDoc()]);
     setFields("라이선스, 지원 GPU, 메모리");
@@ -461,10 +577,50 @@ export default function Home() {
     setAllowed([]);
     setNewOpen(true);
   };
+  function openDemo() {
+    setMode("demo");
+    openNew(true);
+    setModelId("fixture-v1");
+  }
+  async function downloadSetup() {
+    if (setupDownloading) return;
+    setSetupDownloading(true);
+    try {
+      const response = await fetch("/api/setup/provider.zip");
+      if (!response.ok) throw Error("설정 도우미를 받지 못했습니다. 서버 연결과 로그인을 확인하고 다시 시도하세요.");
+      const url = URL.createObjectURL(await response.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "relay-pc-setup.zip";
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast.success("ZIP을 풀고 START-PROVIDER.cmd를 열어주세요.");
+    } catch (e: Any) { toast.error(e.message); }
+    finally { setSetupDownloading(false); }
+  }
+  async function importContract(file?: File) {
+    if (!file) return;
+    try {
+      if (file.size > 16000) throw Error("모델 확인 JSON 파일은 16KB 이하여야 합니다.");
+      const contract = parseModelContract(JSON.parse(await file.text()));
+      setModelForm((form) => ({ ...form, ...contract }));
+      setContractFile(file.name);
+      setManualModel(false);
+      toast.success("모델 확인 정보를 가져왔습니다. 이름과 메모리를 확인하고 승인하세요.");
+    } catch (e: Any) {
+      toast.error(e instanceof SyntaxError ? "JSON 파일을 읽을 수 없습니다. PC 설정 도우미에서 다시 저장하세요." : e.message);
+    }
+  }
   async function create(e: React.FormEvent) {
     e.preventDefault();
+    if (creatingJob.current) return;
+    if (allowed.some(id => !nodes.some((node: Any) => node.id === id && !node.revoked && node.model === (modelId || models[0]?.id)))) {
+      toast.error("선택한 모델을 지원하는 제공자를 다시 선택하세요.");
+      return;
+    }
+    creatingJob.current = true;
     try {
-      const r = await act("create", {
+      const payload = {
         title,
         payer,
         fields: fields
@@ -477,13 +633,18 @@ export default function Home() {
         publicData,
         modelId: modelId || models[0]?.id,
         allowedNodes: allowed,
-      });
+      };
+      const requestId = submissionId(jobSubmission, modeRef.current, "create", payload);
+      const r = await act("create", payload, false, requestId);
+      jobSubmission.current = null;
       setNewOpen(false);
       setSelected(r.jobId);
       toast.success("작업을 제출하고 비용을 예약했습니다.");
       await load();
     } catch {
-      /* Errors are already shown by the action handler. */
+      /* Errors are already shown by the action handler. The request ID survives retry. */
+    } finally {
+      creatingJob.current = false;
     }
   }
   async function upload(files: FileList | null) {
@@ -508,7 +669,7 @@ export default function Home() {
       if (
         !docs.length ||
         docs.length > 4 ||
-        docs.some((d) => typeof d.text !== "string" || d.text.length > 4000)
+        docs.some((d) => !d || typeof d !== "object" || Array.isArray(d) || typeof d.text !== "string" || d.text.length > 4000)
       )
         throw Error("최대 4개 문서, 문서당 4,000자입니다.");
       setDocuments(
@@ -522,7 +683,7 @@ export default function Home() {
       toast.error(e.message);
     }
   }
-  function jobTable(list: Any[]) {
+  function jobTable(list: Any[], filtering = false) {
     return list.length ? (
       <>
         <div className="job-mobile-list">
@@ -599,16 +760,61 @@ export default function Home() {
     ) : (
       <div className="empty">
         <Layers3 size={32} />
-        <h3>첫 번째 작업을 만들어보세요</h3>
-        <p>문서를 넣고 예산을 정하면, 완료된 단계부터 안전하게 기록합니다.</p>
+        <h3>{filtering ? "검색 결과가 없습니다" : "첫 번째 작업을 만들어보세요"}</h3>
+        <p>{filtering ? "다른 작업 이름을 검색하거나 검색어를 지워 전체 작업을 확인하세요." : "문서를 넣고 예산을 정하면, 완료된 단계부터 안전하게 기록합니다."}</p>
         <button
           className="text-action"
-          onClick={() => openNew(mode === "demo")}
+          onClick={() => filtering ? setSearch("") : openNew(mode === "demo")}
         >
-          {mode === "demo" ? "예제 문서로 시작" : "작업 만들기"}{" "}
+          {filtering ? "검색어 지우기" : mode === "demo" ? "예제 문서로 시작" : "작업 만들기"}{" "}
           <ArrowRight size={16} />
         </button>
       </div>
+    );
+  }
+  function renderAdminLogin() {
+    return (
+      <>
+        <form
+          className="form"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            try {
+              const r = await fetch("/api/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ token: adminToken }),
+              });
+              if (r.ok) {
+                setAdminToken("");
+                await load();
+              } else setError("관리자 키를 확인하세요.");
+            } catch {
+              setError(
+                "서버에 연결할 수 없습니다. 실행 상태를 확인하세요.",
+              );
+            }
+          }}
+        >
+          <label>
+            관리자 키
+            <input
+              type="password"
+              value={adminToken}
+              onChange={(e) => setAdminToken(e.target.value)}
+              required
+              autoComplete="current-password"
+            />
+          </label>
+          <button className="primary">로그인</button>
+        </form>
+        <details className="setup-requirements"><summary>관리자 키는 어디에 있나요?</summary><p>기본 위치는 서버 폴더의 <code>.relay/admin-key.txt</code>입니다. 별도 데이터 폴더를 설정했다면 서버 실행 로그의 <code>Administrator key file:</code>에 표시된 경로에서 확인하세요. 자동 연결이 만료되면 키로 로그인하세요. 새 자동 연결을 열려면 기존 Relay 실행 창을 닫은 뒤 다시 실행해야 합니다.</p></details>
+        {error && error !== "로그인이 필요합니다." && (
+          <p className="danger" role="alert">
+            {error}
+          </p>
+        )}
+      </>
     );
   }
   return (
@@ -627,13 +833,15 @@ export default function Home() {
               <Server size={18} />
             </span>
             <span>
-              나의 컴퓨트 풀<small>독립형 스케줄러</small>
+              공유 GPU 컴퓨트<small>LLM 실행 · GPU 제공</small>
             </span>
           </div>
         </SidebarHeader>
         <SidebarContent>
           <WorkspaceNavigation
             section={section}
+            operator={!!data}
+            onProvide={openConnectionSetup}
             onChange={(label) => {
               setSection(label);
               setSearch("");
@@ -641,10 +849,9 @@ export default function Home() {
           />
           <div className="sidebar-note">
             <ShieldCheck size={19} />
-            <b>공개 데이터만 함께</b>
+            <b>실행은 참여자의 GPU에서</b>
             <p>
-              제공자는 문서 내용을 볼 수 있습니다. 승인된 노드에만 작업을
-              맡기세요.
+              모델과 GPU를 선택하고 실행하세요. 입력 내용은 선택한 GPU 제공자에게 전달됩니다.
             </p>
           </div>
         </SidebarContent>
@@ -663,9 +870,10 @@ export default function Home() {
             <span className="breadcrumb">
               나의 풀 <em>/</em>
             </span>{" "}
-            {section}
+            <span className="workspace-section">{section}</span>
           </span>
           <span>
+            <button className="secondary member-header-link" onClick={openConnectionSetup}><Wallet size={16} /> 내 GPU·토큰</button>
             <span className="private">
               <Server size={14} /> 독립 서버
             </span>
@@ -677,6 +885,7 @@ export default function Home() {
                 onClick={async () => {
                   if (signingOut.current) return;
                   signingOut.current = true;
+                  setLoggingOut(true);
                   sessionEpoch.current++;
                   refreshAfterMutation.current = false;
                   setBusy(false);
@@ -694,6 +903,7 @@ export default function Home() {
                     );
                   } finally {
                     signingOut.current = false;
+                    setLoggingOut(false);
                   }
                 }}
               >
@@ -704,11 +914,12 @@ export default function Home() {
         </header>
         <div className="content">
           <div className="topline">
-            <div className="workspace-label">
+            <div className="workspace-label" data-connection={connection} role="status">
               <span className="connection-dot" />{" "}
-              {data ? "스케줄러 연결됨" : "스케줄러 연결"}
+              <span>{connection === "disconnected" ? "서버 연결 끊김" : connection === "checking" ? "서버 연결 중…" : "스케줄러 연결됨"}</span>
+              {connection !== "connected" && lastUpdated && <span> · 마지막 갱신 {date(lastUpdated)}</span>}
             </div>
-            <div className="mode-tabs" role="group" aria-label="실행 환경">
+            {section !== "분산 LLM" && section !== "LLM 실행" && <div className="mode-tabs" role="group" aria-label="실행 환경">
               {[
                 ["demo", "체험 풀"],
                 ["live", "실제 실행"],
@@ -728,15 +939,19 @@ export default function Home() {
                   {label}
                 </button>
               ))}
-            </div>
+            </div>}
           </div>
-          <div className="heading">
+          {section !== "LLM 실행" && <div className="heading">
             <div>
               <h1>
                 {section === "워크스페이스" ? "나의 워크스페이스" : section}
               </h1>
               <p>
-                {section === "워크스페이스"
+                {section === "시작하기"
+                  ? "몇 가지 선택으로 준비하고, 나머지는 자동으로."
+                  : section === "분산 LLM"
+                  ? "여러 GPU에 나눈 하나의 모델로 대화하고, 그룹별 메모리와 실행 상태를 확인하세요."
+                  : section === "워크스페이스"
                   ? "각자의 컴퓨터에서 실행하고, 하나의 공간에서 이어가세요."
                   : section === "GPU 노드"
                     ? "승인한 컴퓨터에서만 추론합니다. 필요할 때 제공을 중단하세요."
@@ -747,14 +962,14 @@ export default function Home() {
                         : "문서별 진행과 결과, 사용한 크레딧을 확인하세요."}
               </p>
             </div>
-            {section !== "설계와 운영" && (
+            {section !== "설계와 운영" && section !== "시작하기" && section !== "분산 LLM" && (
               <button
                 className="primary"
-                disabled={!data || busy || (mode === "live" && !models.length)}
+                disabled={!data || busy}
                 onClick={() =>
                   section === "GPU 노드"
                     ? mode === "live"
-                      ? setModal("node")
+                      ? models.length ? setModal("node") : setSection("시작하기")
                       : toast.info("체험 노드 3대가 준비되어 있습니다.")
                     : openNew()
                 }
@@ -763,65 +978,32 @@ export default function Home() {
                 {section === "GPU 노드" ? "노드 연결" : "새 작업"}
               </button>
             )}
-          </div>
+          </div>}
+          {section === "LLM 실행" && <ServiceHome onRun={openLlm} onProvide={openConnectionSetup} onDistributed={() => setSection("분산 LLM")} />}
+          {section === "LLM 실행" && auth && <details className="operator-entry"><summary>스케줄링 서버 운영자 로그인</summary>{renderAdminLogin()}</details>}
           {error && !auth && (
             <div className="error-banner" role="alert">
               <AlertCircle size={18} />
               <span>{error}</span>
-              <button onClick={() => void load()}>다시 연결</button>
+              <button disabled={connection === "checking"} onClick={() => void load(true)}>{connection === "checking" ? "연결 중…" : "다시 연결"}</button>
             </div>
           )}
-          {auth && (
+          {auth && modal !== "connection" && section !== "LLM 실행" && (
             <div className="card login-card">
-              <KeyRound />
-              <h2>내 서버에 연결</h2>
-              <p>
-                서버에서 발급한 관리자 키로 작업 공간을 여세요. 처음 실행하면{" "}
-                <code>.relay/admin-key.txt</code>에 키가 저장됩니다.
-              </p>
-              <form
-                className="form"
-                onSubmit={async (e) => {
-                  e.preventDefault();
-                  try {
-                    const r = await fetch("/api/login", {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ token: adminToken }),
-                    });
-                    if (r.ok) {
-                      setAdminToken("");
-                      await load();
-                    } else setError("관리자 키를 확인하세요.");
-                  } catch {
-                    setError(
-                      "서버에 연결할 수 없습니다. 실행 상태를 확인하세요.",
-                    );
-                  }
-                }}
-              >
-                <label>
-                  관리자 키
-                  <input
-                    type="password"
-                    value={adminToken}
-                    onChange={(e) => setAdminToken(e.target.value)}
-                    required
-                    autoComplete="current-password"
-                  />
-                </label>
-                <button className="primary">로그인</button>
-              </form>
-              {error && error !== "로그인이 필요합니다." && (
-                <p className="danger" role="alert">
-                  {error}
-                </p>
-              )}
+              <Cpu />
+              <h2>공유 GPU에서 LLM을 실행하세요</h2>
+              <p>개인 계정으로 다른 사람의 GPU와 모델을 선택하고 프롬프트를 실행하세요. 이 콘솔의 관리 기능은 운영자 로그인 후 사용할 수 있습니다.</p>
+              <button className="primary" onClick={openLlm}>GPU에서 LLM 실행 <ArrowRight size={16} /></button>
+              <details className="operator-login">
+                <summary>스케줄링 서버 운영자 로그인</summary>
+                <p>서비스 운영과 보안 관리를 위한 관리자 전용 로그인입니다. 서버 PC에서는 <b>START-RELAY.cmd</b>로 자동 로그인할 수 있습니다.</p>
+                {renderAdminLogin()}
+              </details>
             </div>
           )}
           {data && (
             <>
-              <div className={"mode-banner " + mode}>
+              {section !== "분산 LLM" && section !== "LLM 실행" && <div className={"mode-banner " + mode}>
                 <span className="mode-label">
                   {mode === "demo" ? "체험 환경" : "실제 실행 환경"}
                 </span>
@@ -830,7 +1012,15 @@ export default function Home() {
                     ? "가상 PC로 작업 흐름을 확인합니다. 실제 GPU나 LLM을 사용하지 않으며, 실제 실행과 크레딧이 분리됩니다."
                     : "문서는 승인한 PC에 전달됩니다. 중앙 서버는 작업 배정·검증·정산을 담당하며, PC가 연결되면 추론을 시작합니다."}
                 </span>
-              </div>
+              </div>}
+              {!loggingOut && <div hidden={section !== "분산 LLM"}><InferencePanel onUnauthorized={clearAuthentication} /></div>}
+              {section === "시작하기" && (
+                <SetupGuide mode={mode} models={models} nodes={nodes} busy={busy || setupDownloading}
+                  onDemo={openDemo} onLive={openConnectionSetup}
+                  onModel={() => setModal("model")} onNode={() => setModal("node")}
+                  onCreate={() => openNew()} onNodes={() => setSection("GPU 노드")}
+                  onDownload={() => void downloadSetup()} />
+              )}
               {section === "워크스페이스" && (
                 <>
                   <div className="stats">
@@ -1053,8 +1243,9 @@ export default function Home() {
                   </div>
                   {jobTable(
                     jobs.filter((j: Any) =>
-                      j.title.toLowerCase().includes(search.toLowerCase()),
+                      j.title.toLowerCase().includes(search.trim().toLowerCase()),
                     ),
+                    !!search.trim(),
                   )}
                 </article>
               )}
@@ -1169,28 +1360,26 @@ export default function Home() {
                     <div className="card empty">
                       <Cpu size={34} />
                       <h3>아직 연결된 노드가 없습니다</h3>
-                      <p>승인 모델을 등록한 뒤 제공자 키를 발급하세요.</p>
+                      <p>설정 도우미에서 파일을 선택하고 안내에 따라 연결하세요.</p>
                       <button
                         className="text-action"
-                        onClick={() => setModal("model")}
+                        onClick={() => { setMode("live"); setSection("시작하기"); }}
                       >
-                        승인 모델 등록 <ArrowRight size={16} />
+                        PC 연결 시작하기 <ArrowRight size={16} />
                       </button>
                     </div>
                   )}
                   <div className="card connection-guide">
-                    <h2>실제 제공자 연결</h2>
+                    <h2>클릭으로 PC 연결하기</h2>
                     <ol>
                       <li>
-                        지정한 컴퓨터에서 중앙 서버를 실행하고, 참여 PC의
-                        모델·실행파일·템플릿의 SHA-256을 등록합니다.
+                        PC 설정 도우미에서 모델 파일을 선택하세요. 파일 확인 정보는 자동으로 계산합니다.
                       </li>
                       <li>
-                        노드를 승인하고 제공자 키를 환경 변수에 저장합니다.
+                        웹에서 PC를 등록하고 연결 설정을 저장하세요.
                       </li>
                       <li>
-                        제공자 프로그램이 전용 llama-server를 실행하고 작업을
-                        요청합니다.
+                        도우미에 연결 설정을 가져온 뒤 참여 시작을 누르세요.
                       </li>
                     </ol>
                     <p>
@@ -1198,14 +1387,15 @@ export default function Home() {
                       확인 때 자신이 시작한 추론 프로세스를 종료합니다. 실제
                       메모리 반환 시간은 장비에서 확인해야 합니다.
                     </p>
-                    <a href="/provider.py" download className="text-action">
-                      <Download size={16} /> 제공자 프로그램 받기
-                    </a>
+                    <button onClick={() => void downloadSetup()} disabled={setupDownloading} className="text-action">
+                      <Download size={16} /> PC 설정 도우미 받기
+                    </button>
                   </div>
                 </>
               )}
               {section === "크레딧 원장" && (
                 <>
+                  {mode === "live" && <MemberAllocations />}
                   <div className="stats">
                     {[
                       ["사용 가능", b.available],
@@ -1352,7 +1542,7 @@ export default function Home() {
                       [
                         "06",
                         "작은 풀에 맞춘 저장 구조",
-                        "상태 버전으로 동시 갱신을 보호합니다. 최대 20개 노드, 미보관 작업 24개, 작업당 문서 4개입니다. 대규모 운영 전 테이블 분리와 계측이 필요합니다.",
+                        "상태 버전으로 동시 갱신을 보호합니다. 최대 20개 노드, 원문·결과를 유지하는 작업 24개, 작업당 문서 4개입니다. 대규모 운영 전 테이블 분리와 계측이 필요합니다.",
                       ],
                     ].map(([n, t, p]) => (
                       <article className="card review-card" key={n}>
@@ -1370,9 +1560,8 @@ export default function Home() {
                       외부에서 PC로 연결할 포트를 열 필요가 없습니다.
                     </p>
                     <p>
-                      현재는 관리자가 요청자·제공자 계정을 운영하는 단일
-                      풀입니다. 일반 사용자의 개별 로그인과 여러 풀을 운영하는
-                      서비스는 추가 구현이 필요합니다. 중앙 서버에 문서와 결과가
+                      개인은 자기 계정으로 GPU를 제공하고 토큰을 얻거나 다른 GPU를 이용합니다.
+                      운영자는 서비스와 보안을 관리합니다. 현재 단일 풀을 사용하며 중앙 서버에 문서와 결과가
                       저장되므로 공개 데이터만 제출하세요.
                     </p>
                     <p>
@@ -1381,9 +1570,10 @@ export default function Home() {
                       실측이나 실행 진위 증명이 아닙니다.
                     </p>
                     <p>
-                      모델 병렬화, GPU 간 생성 상태 이동, 임의 DAG, 공개 익명
-                      가입, 현금 정산은 제공하지 않습니다. 종합은 검증된 문서별
-                      항목의 결정적 병합입니다.
+                      문서 추출 작업은 문서별로 실행하고 검증된 항목을 병합합니다.
+                      여러 GPU로 하나의 모델을 실행하려면 운영자가 준비한 분산 LLM을 사용하세요.
+                      개인 계정은 가입 후 GPU 제공과 이용이 가능합니다. GPU 간 생성 상태의 직접 이동,
+                      임의 작업 그래프, 현금 정산은 제공하지 않습니다.
                     </p>
                     <p>
                       공급이 없으면 대기합니다. 기한 경과 시 부분 결과와 실패
@@ -1403,7 +1593,8 @@ export default function Home() {
         </div>
       </main>
 
-      <Dialog open={newOpen} onOpenChange={setNewOpen}>
+      <ParticipantPanel open={modal === "connection"} initialTab={memberTab} onOpenChange={(value) => { if (!value) { connectionFlow.current = false; setModal(null); if (["#run-llm", "#connect-pc"].includes(window.location.hash)) window.history.replaceState(null, "", window.location.pathname + window.location.search); } }} />
+      <Dialog open={newOpen} onOpenChange={(value) => { if (!creatingJob.current) setNewOpen(value); }}>
         <DialogContent className="wide-dialog">
           <DialogHeader>
             <DialogTitle>새 문서 추출 작업</DialogTitle>
@@ -1428,7 +1619,7 @@ export default function Home() {
                 실행 모델
                 <Select
                   value={modelId || models[0]?.id || ""}
-                  onValueChange={setModelId}
+                  onValueChange={value => { setModelId(value); setAllowed([]); }}
                 >
                   <SelectTrigger>
                     <SelectValue placeholder="승인 모델 선택" />
@@ -1600,10 +1791,15 @@ export default function Home() {
             </div>
             <fieldset className="allow-nodes">
               <legend>
-                허용 제공자 <small>선택하지 않으면 모든 승인 노드</small>
+                허용 제공자 <small>선택하지 않으면 이 모델을 지원하는 모든 승인 노드</small>
               </legend>
+              {allowed.length > 0 && (
+                <button type="button" className="quiet" onClick={() => setAllowed([])}>
+                  제공자 선택 초기화
+                </button>
+              )}
               {nodes
-                .filter((n: Any) => !n.revoked)
+                .filter((n: Any) => !n.revoked && n.model === (modelId || models[0]?.id))
                 .map((n: Any) => (
                   <label className="check-label" key={n.id}>
                     <Checkbox
@@ -1812,13 +2008,13 @@ export default function Home() {
                       setConfirm({
                         action: "archive",
                         payload: { jobId: job.id },
-                        title: "결과를 내보내고 보관할까요?",
+                        title: "원문·결과 삭제",
                         description:
-                          "정산 기록은 유지하지만 원문과 추출 결과는 삭제합니다. 필요한 파일을 먼저 내보내세요.",
+                          "원문과 추출 결과를 영구 삭제하고 목록에서 제거합니다. 복구할 수 없으며 정산 기록만 유지됩니다. 필요한 결과는 돌아가서 JSONL, CSV 또는 Markdown으로 먼저 저장하세요. 이 버튼은 파일을 저장하지 않습니다.",
                       })
                     }
                   >
-                    <Archive size={14} /> 결과 정리
+                    <Trash2 size={14} /> 원문·결과 삭제
                   </button>
                 )}
               </div>
@@ -1828,220 +2024,172 @@ export default function Home() {
       </Dialog>
       <Dialog
         open={modal === "model"}
-        onOpenChange={(v) => {
-          if (!v) setModal(null);
-        }}
+        onOpenChange={(v) => { if (!v) setModal(connectionFlow.current ? "connection" : null); }}
       >
         <DialogContent className="wide-dialog">
           <DialogHeader>
-            <DialogTitle>승인 모델 등록</DialogTitle>
+            <DialogTitle>모델 준비하기</DialogTitle>
             <DialogDescription>
-              정확한 파일과 실행 환경을 고정합니다. 해시가 다르면 작업을
-              배정하지 않습니다.
+              PC 설정 도우미에서 저장한 모델 확인 파일을 가져오세요. 파일 확인 값은 자동으로 입력됩니다.
             </DialogDescription>
           </DialogHeader>
-          <form
-            className="form"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              try {
-                await act("model", modelForm);
-                setModal(null);
-                toast.success("모델 계약을 등록했습니다.");
-              } catch {
-                /* Errors are already shown by the action handler. */
-              }
-            }}
-          >
-            {(["name", "digest", "runtime", "template"] as const).map((k) => (
-              <label key={k}>
-                {
-                  {
-                    name: "모델 이름",
-                    digest: "GGUF 파일 SHA-256",
-                    runtime: "llama-server 실행파일 SHA-256",
-                    template: "chat template SHA-256",
-                  }[k]
-                }
-                <input
-                  required
-                  value={modelForm[k]}
-                  maxLength={k === "name" ? 100 : 64}
-                  pattern={k === "name" ? undefined : "[a-f0-9]{64}"}
-                  onChange={(e) =>
-                    setModelForm((f) => ({ ...f, [k]: e.target.value }))
-                  }
-                />
-              </label>
-            ))}
-            <div className="form-row">
-              <label>
-                고정 문맥 길이
-                <input
-                  required
-                  type="number"
-                  min={4096}
-                  max={131072}
-                  value={modelForm.context}
-                  onChange={(e) =>
-                    setModelForm((f) => ({
-                      ...f,
-                      context: Number(e.target.value),
-                    }))
-                  }
-                />
-              </label>
-              <label>
-                필요 VRAM (MiB)
-                <input
-                  required
-                  type="number"
-                  min={0}
-                  max={200000}
-                  value={modelForm.minVram}
-                  onChange={(e) =>
-                    setModelForm((f) => ({
-                      ...f,
-                      minVram: Number(e.target.value),
-                    }))
-                  }
-                />
-              </label>
-            </div>
-            <button className="primary" disabled={busy}>
-              모델 승인
+          <input ref={contractInput} type="file" accept=".json,application/json" hidden
+            onChange={(e) => { void importContract(e.target.files?.[0]); e.target.value = ""; }} />
+          <div className="setup-import">
+            <FileText size={25} />
+            <b>{contractFile || "모델 확인 파일을 선택하세요"}</b>
+            <p>{contractFile ? "확인 정보를 가져왔습니다. 아래 설정을 확인하세요." : "도우미에서 파일을 선택하고 파일 검사 → 모델 검증 파일 저장을 누르세요."}</p>
+            <button className="secondary" onClick={() => contractInput.current?.click()} disabled={busy}>
+              <Upload size={16} /> {contractFile ? "다른 파일 가져오기" : "모델 확인 파일 가져오기"}
+            </button>
+          </div>
+          <form className="form" onSubmit={async (e) => {
+            e.preventDefault();
+            try {
+              const requestId = submissionId(modelSubmission, modeRef.current, "model", modelForm);
+              await act("model", modelForm, false, requestId);
+              modelSubmission.current = null;
+              setModal(connectionFlow.current ? "connection" : null);
+              setContractFile("");
+              setModelForm({ name: "", digest: "", runtime: "", template: "", context: 8192, minVram: 4096 });
+              setManualModel(false);
+              toast.success("모델 준비가 끝났습니다. 이제 PC를 등록하세요.");
+            } catch { /* The action handler shows errors. */ }
+          }}>
+            <label>모델 이름
+              <input required maxLength={100} placeholder="예: 우리 팀 문서 분석 모델" value={modelForm.name}
+                onChange={(e) => setModelForm((f) => ({ ...f, name: e.target.value }))} />
+            </label>
+            <label>모델에 필요한 GPU 메모리 (GB)
+              <input required type="number" min={0} max={195} step={0.5} value={modelForm.minVram / 1024}
+                onChange={(e) => setModelForm((f) => ({ ...f, minVram: Number(e.target.value) * 1024 }))} />
+              <small>운영자가 모델 실행에 필요한 메모리를 확인해 지정하세요. 자동 측정값이 아닙니다.</small>
+            </label>
+            <details open={manualModel} onToggle={(e) => setManualModel(e.currentTarget.open)} className="setup-advanced">
+              <summary>고급 설정 · 직접 입력</summary>
+              <div className="form">
+                {(["digest", "runtime", "template"] as const).map((k) => (
+                  <label key={k}>{{ digest: "GGUF 파일 SHA-256", runtime: "llama-server 실행파일 SHA-256", template: "chat template SHA-256" }[k]}
+                    <input required value={modelForm[k]} maxLength={64} pattern="[a-f0-9]{64}"
+                      onChange={(e) => { setContractFile(""); setModelForm((f) => ({ ...f, [k]: e.target.value })); }} />
+                  </label>
+                ))}
+                <label>문맥 길이
+                  <input required type="number" min={4096} max={131072} value={modelForm.context}
+                    onChange={(e) => setModelForm((f) => ({ ...f, context: Number(e.target.value) }))} />
+                  <small>PC 설정 도우미의 문맥 길이와 같아야 합니다.</small>
+                </label>
+              </div>
+            </details>
+            <button className="primary" disabled={busy || ![modelForm.digest, modelForm.runtime, modelForm.template].every((v) => /^[a-f0-9]{64}$/.test(v))}>
+              <Check size={16} /> {busy ? "모델 확인 중…" : "이 모델 사용하기"}
             </button>
           </form>
         </DialogContent>
       </Dialog>
-      <Dialog
-        open={modal === "node"}
-        onOpenChange={(v) => {
-          if (!v) setModal(null);
-        }}
-      >
+      <Dialog open={modal === "node"} onOpenChange={(v) => { if (!v && !creatingNode) setModal(connectionFlow.current ? "connection" : null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>제공자 노드 승인</DialogTitle>
-            <DialogDescription>
-              키는 한 번 표시됩니다. 이 키로 자신에게 배정된 작업만 실행할 수
-              있습니다.
-            </DialogDescription>
+            <DialogTitle>내 PC 등록하기</DialogTitle>
+            <DialogDescription>이름을 정하면 연결 설정을 만들어 드립니다. 연결 키와 서버 주소를 직접 입력할 필요가 없습니다.</DialogDescription>
           </DialogHeader>
-          <form
-            className="form"
-            onSubmit={async (e) => {
-              e.preventDefault();
-              try {
-                const token = crypto.randomUUID() + crypto.randomUUID();
-                const r = await act("node", {
-                  ...nodeForm,
-                  modelId: nodeForm.modelId || models[0]?.id,
-                  token,
-                });
-                setCredential({ ...r, token, poolId: data.poolId });
-                setModal(null);
-              } catch {
-                /* Errors are already shown by the action handler. */
+          <form className="form" onSubmit={async (e) => {
+            e.preventDefault();
+            if (pairing.current) return;
+            pairing.current = true;
+            const pairingSession = sessionEpoch.current;
+            setCreatingNode(true);
+            try {
+              const response = await fetch("/api/setup");
+              if (pairingSession !== sessionEpoch.current || signingOut.current)
+                throw new DOMException("세션이 변경되었습니다.", "AbortError");
+              if (response.status === 401) {
+                clearAuthentication();
+                throw new DOMException("다시 로그인하세요.", "AbortError");
               }
-            }}
-          >
-            <label>
-              노드 이름
-              <input
-                required
-                maxLength={80}
-                value={nodeForm.name}
-                onChange={(e) =>
-                  setNodeForm((n) => ({ ...n, name: e.target.value }))
-                }
-              />
+              if (!response.ok) throw Error("서버 연결 정보를 읽지 못했습니다. 다시 로그인하고 시도하세요.");
+              const setup = await response.json();
+              if (pairingSession !== sessionEpoch.current || signingOut.current || modeRef.current !== "live")
+                throw new DOMException("세션이 변경되었습니다.", "AbortError");
+              const chosenModel = models.find((m: Any) => m.id === (nodeForm.modelId || models[0]?.id));
+              const nodePayload = { ...nodeForm, modelId: chosenModel.id };
+              const fingerprint = JSON.stringify({ mode: modeRef.current, ...nodePayload });
+              if (nodeCredential.current?.fingerprint !== fingerprint)
+                nodeCredential.current = { fingerprint, token: crypto.randomUUID() + crypto.randomUUID() };
+              const token = nodeCredential.current.token;
+              // Retain the token as well as the ID when a committed registration response is lost.
+              // Validate the complete configuration before registering a node.
+              connectionConfig({ coordinator: setup.coordinator, credential: { nodeId: "pending", nodeName: nodeForm.name, poolId: data.poolId, token }, model: chosenModel });
+              const payload = { ...nodePayload, token };
+              const requestId = submissionId(nodeSubmission, modeRef.current, "node", payload);
+              const r = await act("node", payload, false, requestId);
+              const config = connectionConfig({ coordinator: setup.coordinator, credential: { ...r, nodeName: nodeForm.name, token, poolId: data.poolId }, model: chosenModel });
+              setCredential({ ...r, token, poolId: data.poolId, config, localOnly: setup.localOnly });
+              setCredentialSaved(false);
+              nodeSubmission.current = null;
+              nodeCredential.current = null;
+              connectionFlow.current = false;
+              setModal(null);
+              setNodeForm({ name: "", modelId: "", vram: 8192 });
+            } catch (e: Any) { if (e.name !== "AbortError") toast.error(e.message); }
+            finally { pairing.current = false; setCreatingNode(false); }
+          }}>
+            <label>PC 이름
+              <input required maxLength={80} placeholder="예: 작업실 PC" value={nodeForm.name}
+                onChange={(e) => setNodeForm((n) => ({ ...n, name: e.target.value }))} />
             </label>
-            <label>
-              승인 모델
-              <Select
-                value={nodeForm.modelId || models[0]?.id || ""}
-                onValueChange={(v) =>
-                  setNodeForm((n) => ({ ...n, modelId: v }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="모델 선택" />
-                </SelectTrigger>
-                <SelectContent>
-                  {models.map((m: Any) => (
-                    <SelectItem key={m.id} value={m.id}>
-                      {m.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
+            <label>사용할 모델
+              <Select value={nodeForm.modelId || models[0]?.id || ""} onValueChange={(v) => setNodeForm((n) => ({ ...n, modelId: v }))}>
+                <SelectTrigger><SelectValue placeholder="모델 선택" /></SelectTrigger>
+                <SelectContent>{models.map((m: Any) => <SelectItem key={m.id} value={m.id}>{m.name}</SelectItem>)}</SelectContent>
               </Select>
             </label>
-            <label>
-              할당 가능한 VRAM (MiB)
-              <input
-                type="number"
-                min={0}
-                max={200000}
-                required
-                value={nodeForm.vram}
-                onChange={(e) =>
-                  setNodeForm((n) => ({ ...n, vram: Number(e.target.value) }))
-                }
-              />
+            <label>할당할 GPU 메모리 (GB)
+              <input type="number" min={0} max={195} step={0.5} required value={nodeForm.vram / 1024}
+                onChange={(e) => setNodeForm((n) => ({ ...n, vram: Number(e.target.value) * 1024 }))} />
+              <small>PC에서 사용할 수 있는 메모리를 입력하세요. 연결 후 자동 측정되지는 않습니다.</small>
             </label>
-            <button className="primary" disabled={busy || !models.length}>
-              승인하고 키 발급
+            <button className="primary" disabled={busy || creatingNode || !models.length}>
+              {creatingNode ? <RefreshCw className="spin" size={16} /> : <ArrowRight size={16} />}
+              {creatingNode ? "연결 설정 준비 중…" : "연결 설정 만들기"}
             </button>
           </form>
         </DialogContent>
       </Dialog>
-      <Dialog
-        open={!!credential}
-        onOpenChange={(v) => {
-          if (!v) setCredential(null);
-        }}
-      >
+      <Dialog open={!!credential} onOpenChange={(v) => {
+        if (!v && credentialSaved) setCredential(null);
+        else if (!v) toast.info("연결 키는 다시 표시되지 않습니다. 연결 설정을 먼저 저장하세요.");
+      }}>
         <DialogContent className="wide-dialog">
           <DialogHeader>
-            <DialogTitle>제공자 연결 정보</DialogTitle>
-            <DialogDescription>
-              키를 안전하게 저장하세요. 닫은 뒤에는 다시 확인할 수 없습니다.
-            </DialogDescription>
+            <DialogTitle>연결 설정이 준비되었어요</DialogTitle>
+            <DialogDescription>연결 설정을 저장하면 PC 도우미가 다운로드한 파일을 자동으로 찾습니다. 파일에는 이 PC의 이름과 개인 연결 키가 포함됩니다.</DialogDescription>
           </DialogHeader>
-          {credential && (
-            <>
-              <label>
-                제공자 키<code className="secret">{credential.token}</code>
-              </label>
-              <p className="mono credential-id">
-                풀: {credential.poolId}
-                <br />
-                노드: {credential.nodeId}
-              </p>
-              <p className="body-note muted">
-                제공자 실행 시 RELAY_NODE_TOKEN 환경 변수에 키를 지정하세요.
-                키를 문서나 저장소에 넣지 마세요.
-              </p>
-              <button
-                className="secondary"
-                onClick={() =>
-                  save(
-                    "relay-provider-private.json",
-                    JSON.stringify(credential, null, 2),
-                  )
-                }
-              >
-                <Download size={15} /> 연결 정보 저장
-              </button>
-            </>
-          )}
+          {credential && <>
+            <ol className="setup-handoff">
+              <li><b>1. 연결 설정 저장</b><span>아래 버튼으로 설정 파일을 다운로드하세요. 다른 PC가 참여한다면 해당 PC로 파일을 전달하세요.</span></li>
+              <li><b>2. 도우미에서 연결 확인</b><span>도우미를 열면 다운로드 폴더에서 연결 파일을 찾습니다. 이미 열려 있어도 새 파일을 확인합니다. 여러 개라면 서비스 주소와 PC 이름을 보고 선택하세요.</span></li>
+              <li><b>3. 참여 시작</b><span>도우미에서 검사하고 참여 시작을 누르면 연결 상태가 자동으로 표시됩니다.</span></li>
+            </ol>
+            {credential.localOnly && <div className="inline-notice"><Monitor size={18} /> 이 설정은 서버와 같은 PC에서 사용할 수 있습니다. 다른 PC는 운영자가 서버의 HTTPS 주소를 먼저 설정해야 합니다.</div>}
+            <div className="setup-actions">
+              <button className="primary" onClick={() => {
+                const fileId = String(credential.nodeId).replace(/[^a-zA-Z0-9-]/g, "").slice(0, 80) || "pc";
+                save(`relay-provider-${fileId}.json`, JSON.stringify(credential.config, null, 2), "application/json");
+                setCredentialSaved(true);
+              }}><Download size={16} /> {credentialSaved ? "연결 설정 다시 저장" : "연결 설정 저장"}</button>
+              <button className="secondary" disabled={!credentialSaved} onClick={() => { setCredential(null); setSection("시작하기"); }}>저장했어요 · 연결 확인</button>
+            </div>
+            <p className="muted small">다른 폴더에 저장했다면 도우미의 ‘연결 폴더 선택’ 또는 ‘연결 파일 불러오기’를 사용하세요. 기존에 선택한 연결은 유지되며, 참여 시작은 직접 눌러야 합니다.</p>
+            <p className="muted small">다운로드한 연결 설정은 이 PC의 비밀번호처럼 보관하세요. 키를 잃어버리면 GPU 노드에서 기존 키를 폐기하고 다시 등록하세요.</p>
+            <details className="setup-advanced"><summary>연결 정보 직접 확인</summary><label>제공자 키<code className="secret">{credential.token}</code></label><p className="mono credential-id">풀: {credential.poolId}<br />노드: {credential.nodeId}</p></details>
+          </>}
         </DialogContent>
       </Dialog>
       <AlertDialog
         open={!!confirm}
         onOpenChange={(v) => {
-          if (!v) setConfirm(null);
+          if (!v && !busy) setConfirm(null);
         }}
       >
         <AlertDialogContent>
@@ -2052,17 +2200,21 @@ export default function Home() {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel>돌아가기</AlertDialogCancel>
+            <AlertDialogCancel disabled={busy}>돌아가기</AlertDialogCancel>
             <AlertDialogAction
-              onClick={() => {
+              disabled={busy}
+              variant={confirm?.action === "archive" ? "destructive" : "default"}
+              onClick={async (event) => {
+                event.preventDefault();
                 const c = confirm;
-                setConfirm(null);
-                void run(c.action, c.payload, "처리했습니다.").then(() => {
+                if (!c || busy) return;
+                if (await run(c.action, c.payload, "처리했습니다.")) {
+                  setConfirm(null);
                   if (c.action === "archive") setSelected(null);
-                });
+                }
               }}
             >
-              확인
+              {busy ? "처리 중…" : confirm?.action === "archive" ? "삭제" : "확인"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

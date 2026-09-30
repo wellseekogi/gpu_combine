@@ -13,10 +13,12 @@
 # testing
 /coverage
 
-# next.js
+# Legacy framework output (not used by the current Vite app)
 /.next/
 /.vinext/
 /out/
+/dist/
+/.wrangler/
 
 # misc
 .DS_Store
@@ -34,19 +36,28 @@ yarn-error.log*
 # vercel
 .vercel
 
-# typescript
+# TypeScript and Python caches
 next-env.d.ts
-/dist/
-/.wrangler/
+*.tsbuildinfo
+__pycache__/
+*.pyc
+
+# Current web build
+/standalone-dist/
+
 # Checkout-local execution profile and tool state; never publish them.
 /.sites-runtime/
 /.agents/
 /.codex/
+/.agentworkforce/
+
+# Generated deliverables, experiments, and temporary test data
 /outputs/
 /work/
 
+# Local service state and model exports
 /.relay/
-/standalone-dist/
-__pycache__/
-*.pyc
-*.tsbuildinfo
+/relay-model-contract.json
+
+# Local inference deployment identities and credential hashes.
+/inference.local.json

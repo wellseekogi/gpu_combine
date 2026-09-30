@@ -175,6 +175,61 @@ test("idle and missing pools are not rewritten or created", async t => {
   assert.equal(store.db.prepare("SELECT COUNT(*) AS count FROM relay_pools").get().count, 0);
 });
 
+test("unchanged maintenance revisions skip parsing until the exact deadline; changed revisions are checked", async t => {
+  const {state} = await live();
+  const store = new SqliteStore([["local-owner", state]]);
+  let now = start, reads = 0;
+  const read = store.read;
+  store.read = async id => { const row = await read(id); return {...row, get state() { reads++; return row.state; }}; };
+  const maintenance = scheduler(store, {clock: () => now});
+  t.after(async () => { await maintenance.stop(); store.close(); });
+  await maintenance.runOnce();
+  assert.equal(reads, 1);
+  now = start + LEASE_MS - 1;
+  assert.equal((await maintenance.runOnce()).ticks, 0);
+  assert.equal(reads, 1);
+  now++;
+  assert.equal((await maintenance.runOnce()).ticks, 1);
+  assert.equal(store.state().books.live.jobs[0].tasks[0].status, "ready");
+  await maintenance.runOnce();
+  const before = reads;
+  await maintenance.runOnce();
+  assert.equal(reads, before);
+  const current = store.state();
+  current.books.live.jobs[0].deadline = now;
+  assert.equal(await store.compareAndSwap("local-owner", store.revision(), JSON.stringify(current)), true);
+  assert.equal((await maintenance.runOnce()).ticks, 1);
+  assert.equal(store.state().books.live.jobs[0].tasks[0].status, "failed");
+});
+
+test("idle rentals expire without browser traffic and provider heartbeats refresh their deadline", async t => {
+  const state = initialState(start), account = "member-" + crypto.randomUUID();
+  await transition(state, "live", "member-account", {account}, start);
+  await transition(state, "live", "allocate", {account, amount: 10}, start);
+  const {modelId} = await transition(state, "live", "model", model, start);
+  const token = crypto.randomUUID() + crypto.randomUUID();
+  const {nodeId} = await transition(state, "live", "node", {name: "Rental GPU", modelId, vram: 0, tokenHash: await hash(token)}, start);
+  const poll = {...contract, capabilities: ["renter-model", "rental-session"]};
+  await transition(state, "live", "poll", poll, start, nodeId);
+  const artifact = {id: crypto.randomUUID(), name: "synthetic.gguf", digest: "d".repeat(64), size: 1024};
+  const {jobId} = await transition(state, "live", "rent", {payer: account, publicData: true, allowedNodes: [nodeId], context: 4096}, start, null, {modelArtifact: artifact});
+  const store = new SqliteStore([["local-owner", state]]);
+  let now = start;
+  const maintenance = scheduler(store, {clock: () => now});
+  t.after(async () => { await maintenance.stop(); store.close(); });
+  assert.equal((await maintenance.runOnce()).ticks, 0);
+  now += 1000;
+  await execute(store, "local-owner", {mode: "live", action: "poll", nodeId, token, payload: {...poll, rentalId: jobId, rentalStage: "ready"}}, {provider: true, now});
+  now = start + 45000;
+  assert.equal((await maintenance.runOnce()).ticks, 0);
+  now += 1000;
+  assert.equal((await maintenance.runOnce()).ticks, 1);
+  const current = store.state(), rental = current.books.live.jobs[0];
+  assert.equal(rental.rentalStage, "failed");assert.equal(rental.finishedAt, now);
+  assert.equal(rental.tasks.length, 0);assert.equal(current.books.live.accounts[account], 10);
+  assertInvariants(current);
+});
+
 test("maintenance pages existing pools within its per-pass bound", async t => {
   const {state} = await live({leased: false, minutes: 1});
   const store = new SqliteStore(["a", "b", "c"].map(id => [id, state]));

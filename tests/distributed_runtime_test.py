@@ -6,11 +6,13 @@ import struct
 from bisect import bisect_right
 import socket
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 spec = importlib.util.spec_from_file_location("provider.distributed_runtime", Path(__file__).parents[1] / "provider" / "distributed_runtime.py")
 module = importlib.util.module_from_spec(spec)
@@ -80,12 +82,47 @@ class DistributedRuntimeTests(unittest.TestCase):
                 self.runtime(["rpc", *self.common, "--bind", bad])
         with self.assertRaisesRegex(ValueError, "trusted-private-network"):
             self.runtime([value for value in self.server if value != "--trusted-private-network"])
+        with self.assertRaisesRegex(ValueError, "trusted-private-network"):
+            self.runtime(["rpc", *[value for value in self.common if value != "--trusted-private-network"],
+                          "--bind", "100.64.1.2"])
         for flags in (("--binary-sha256", "0" * 64), ("--device", "CUDA0,CUDA0"),
-                      ("--device", "RPC0"), ("--rpc", "10.0.0.2:80,10.0.0.2:080")):
+                      ("--device", "RPC0"), ("--device", "CUDA0,CUDA1"), ("--rpc", ""),
+                      ("--rpc", "10.0.0.2:80,10.0.0.2:080")):
             with self.subTest(flags=flags), self.assertRaises(ValueError):
                 self.runtime([*self.server, *flags])
         rpc = self.runtime(["rpc", *self.common, "--bind", "100.64.1.2"])
         self.assertEqual(rpc.command()[1:], ["--host", "100.64.1.2", "--port", "50052", "--device", "CUDA0"])
+
+    def test_local_gpu_groups_omit_rpc_and_keep_manifest_and_file_checks(self):
+        argv = [value for value in self.server if value not in
+                ("--rpc", "100.64.1.2:50052", "--trusted-private-network")]
+        for devices, gpus, split in (("CUDA0", [{"id": "local", "layers": 64}], "65"),
+                                    ("CUDA0,CUDA1", [{"id": "local", "layers": 32},
+                                                     {"id": "second", "layers": 32}], "32,33")):
+            with self.subTest(devices=devices):
+                self.config["groups"][0]["gpus"] = gpus
+                self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
+                local = [*argv, "--device", devices]
+                runtime = self.runtime(local)
+                process = Mock()
+                process.poll.return_value = None
+                with patch.object(module.socket, "socket"), \
+                        patch.object(module, "request_json", side_effect=[{}, self.props(runtime)]), \
+                        patch.object(module.subprocess, "Popen", return_value=process) as popen:
+                    runtime.start()
+                command = popen.call_args.args[0]
+                self.assertNotIn("--rpc", command)
+                for option, expected in (("--device", devices), ("--tensor-split", split),
+                                         ("--host", "127.0.0.1"), ("--gpu-layers", "all")):
+                    self.assertEqual(command[command.index(option) + 1], expected)
+                runtime.stop_runtime()
+                for option, value in (("--binary-sha256", "0" * 64), ("--device", devices + ",CUDA2")):
+                    with self.assertRaises(ValueError):
+                        self.runtime([*local, option, value])
+        self.config["groups"][0]["modelSha256"] = "0" * 64
+        self.config_path.write_text(json.dumps(self.config), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Model SHA-256"):
+            self.runtime(local)
 
     def test_shared_manifest_pins_contract_and_rejects_invalid_or_oversized_config(self):
         runtime = self.runtime()
@@ -109,6 +146,34 @@ class DistributedRuntimeTests(unittest.TestCase):
         self.config_path.write_bytes(b" " * (256 * 1024 + 1))
         with self.assertRaisesRegex(ValueError, "256 KiB"):
             self.runtime()
+
+    def test_optional_batch_limits_preserve_defaults_and_reject_invalid_sizes_before_spawn(self):
+        for batch, ubatch in ((None, None), (512, 128), (1, 1), (4096, 4096)):
+            flags = [] if batch is None else ["--batch-size", str(batch), "--ubatch-size", str(ubatch)]
+            with self.subTest(batch=batch, ubatch=ubatch):
+                runtime = self.runtime([*self.server, *flags])
+                runtime.slot_directory = tempfile.TemporaryDirectory()
+                command = runtime.command()
+                if batch is None:
+                    self.assertNotIn("--batch-size", command)
+                    self.assertNotIn("--ubatch-size", command)
+                else:
+                    for option, value in (("--batch-size", batch), ("--ubatch-size", ubatch)):
+                        self.assertEqual(command[command.index(option) + 1], str(value))
+        for flags in (("--batch-size", "512"), ("--ubatch-size", "128"),
+                      ("--batch-size", "0", "--ubatch-size", "1"),
+                      ("--batch-size", "512", "--ubatch-size", "0"),
+                      ("--batch-size", "512", "--ubatch-size", "-1"),
+                      ("--batch-size", "128", "--ubatch-size", "512"),
+                      ("--batch-size", "4097", "--ubatch-size", "128")):
+            with self.subTest(flags=flags), patch.object(module.subprocess, "Popen") as popen:
+                with self.assertRaisesRegex(ValueError, "ubatch <= batch <= contextTokens"):
+                    self.runtime([*self.server, *flags])
+                popen.assert_not_called()
+        for argv in ([*self.server, "--batch-size", "1.5", "--ubatch-size", "1"],
+                     ["rpc", *self.common, "--bind", "100.64.1.2", "--batch-size", "512", "--ubatch-size", "128"]):
+            with self.subTest(argv=argv), patch.object(module.sys, "stderr"), self.assertRaises(SystemExit):
+                module.parser().parse_args(argv)
 
     def test_layer_split_includes_output_head_and_matches_b10964_float_boundaries(self):
         def float32(value):
@@ -181,6 +246,7 @@ class DistributedRuntimeTests(unittest.TestCase):
             runtime.start()
         command = popen.call_args.args[0]
         for option, value in (("--ctx-size", "8192"), ("--parallel", "2"), ("--split-mode", "layer"),
+                              ("--rpc", "100.64.1.2:50052"), ("--device", "CUDA0,RPC0"),
                               ("--host", "127.0.0.1"), ("--fit", "off"), ("--gpu-layers", "all"),
                               ("--cache-ram", "0"), ("--ctx-checkpoints", "0")):
             self.assertEqual(command[command.index(option) + 1], value)
@@ -258,6 +324,103 @@ class DistributedRuntimeTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "no automatic"):
                         runtime.run()
             self.assertIsNone(runtime.process)
+
+    def test_reporting_checks_origin_credentials_and_only_local_gpu_ids_before_spawn(self):
+        for origin in ("http://example.com", "https://user:password@example.com", "https://example.com/path",
+                       "https://example.com/?key=secret", "https://example.com:0", "https://example.com\\evil"):
+            with self.subTest(origin=origin), patch.dict(module.os.environ, {"RELAY_INFERENCE_PROVIDER_TOKEN": "k" * 32}):
+                with self.assertRaises(ValueError):
+                    self.runtime([*self.server, "--coordinator", origin, "--gpu-id", "local"])
+        with patch.dict(module.os.environ, {}, clear=True), self.assertRaisesRegex(ValueError, "PROVIDER_TOKEN"):
+            self.runtime([*self.server, "--coordinator", "https://relay.example", "--gpu-id", "local"])
+        with patch.dict(module.os.environ, {"RELAY_INFERENCE_PROVIDER_TOKEN": "k" * 32}):
+            for ids in ([], ["remote"], ["local", "remote"], ["local", "local"]):
+                options = [item for gpu_id in ids for item in ("--gpu-id", gpu_id)]
+                with self.subTest(ids=ids), self.assertRaises(ValueError):
+                    self.runtime([*self.server, "--coordinator", "https://relay.example", *options])
+
+    def test_reclaim_finishes_while_coordinator_is_blocked_and_reports_in_order(self):
+        entered, unblock = threading.Event(), threading.Event()
+        reported = []
+        transports = []
+        closed_on = []
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        with patch.dict(module.os.environ, {"RELAY_INFERENCE_PROVIDER_TOKEN": "k" * 32}):
+            runtime = self.runtime([*self.server, "--coordinator", "https://relay.example", "--gpu-id", "local"])
+            def response(url, payload=None, token=None, **kwargs):
+                if url.startswith("https://"):
+                    reported.append(payload)
+                    transports.append((token, kwargs["timeout"]))
+                    if payload["state"] == "providing":
+                        entered.set()
+                        unblock.wait(timeout=5)
+                        raise URLError("coordinator offline")
+                    return {"ok": True}
+                return self.props(runtime) if url.endswith("/props") else {}
+            try:
+                with patch.object(module.socket, "socket"), patch.object(module, "request_json", side_effect=response), \
+                        patch.object(module, "close_http_connections", side_effect=lambda: closed_on.append(threading.get_ident())), \
+                        patch.object(module.subprocess, "Popen", return_value=process) as popen:
+                    runtime.start()
+                    self.assertTrue(entered.wait(timeout=2))
+                    runtime.request_stop()
+                    self.assertEqual(runtime.state, "released")
+                    self.assertIsNone(runtime.process)
+                    process.terminate.assert_called_once()
+                    process.wait.assert_called_once()
+                    self.assertFalse(unblock.is_set())
+                    self.assertNotIn("RELAY_INFERENCE_PROVIDER_TOKEN", popen.call_args.kwargs["env"])
+                    unblock.set()
+                    runtime._notifications.put(None)
+                    runtime._notifier.join(timeout=2)
+            finally:
+                unblock.set()
+                if runtime._notifier.is_alive():
+                    runtime._notifications.put(None)
+                    runtime._notifier.join(timeout=2)
+        self.assertEqual([entry["state"] for entry in reported], ["providing", "reclaiming", "released"])
+        self.assertEqual(transports, [("k" * 32, 2)] * 3)
+        self.assertEqual(closed_on, [runtime._notifier.ident], "notifier closes its own thread-local transport")
+        self.assertTrue(all(entry["runtimeId"] == runtime.runtime_id and entry["startedAt"] == runtime.started_at
+                            and entry["groupId"] == "large" and entry["gpuIds"] == ["local"] for entry in reported))
+
+    def test_run_closes_startup_transport_even_if_start_fails(self):
+        runtime = self.runtime()
+        with patch.object(runtime, "start", side_effect=RuntimeError("synthetic startup failure")), \
+                patch.object(module, "close_http_connections", wraps=module.close_http_connections) as close:
+            with self.assertRaisesRegex(RuntimeError, "synthetic startup failure"):
+                runtime.run()
+        close.assert_called_once_with()
+
+    def test_failed_owned_process_exit_never_reports_return_complete(self):
+        runtime = self.runtime()
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("owned", 5)
+        runtime.process = process
+        with self.assertRaises(subprocess.TimeoutExpired):
+            runtime.request_stop()
+        self.assertEqual(runtime.state, "reclaiming")
+        self.assertIs(runtime.process, process)
+        process.kill.assert_called_once()
+        process.wait.side_effect = None
+        runtime.stop_runtime()
+        self.assertEqual(runtime.state, "released")
+
+    def test_stop_confirms_real_owned_process_exit_without_a_gpu(self):
+        runtime = self.runtime()
+        def response(url, **kwargs):
+            return self.props(runtime) if url.endswith("/props") else {}
+        with patch.object(module.socket, "socket"), patch.object(module, "request_json", side_effect=response), \
+                patch.object(runtime, "command", return_value=[sys.executable, "-c", "import time; time.sleep(30)"]):
+            runtime.start()
+        process = runtime.process
+        self.assertIsNone(process.poll())
+        runtime.request_stop()
+        self.assertIsNotNone(process.poll())
+        self.assertEqual(runtime.state, "released")
 
 
 if __name__ == "__main__":

@@ -254,22 +254,6 @@ def fetch_bytes(url, *, token=None, max_bytes, timeout):
     return bytes(output)
 
 
-def _optional_token():
-    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
-        value = os.environ.get(name, "").strip()
-        if value and len(value) <= 4096 and not any(ord(c) < 32 for c in value):
-            return value
-    try:
-        result = subprocess.run(["gh", "auth", "token", "--hostname", "github.com"], capture_output=True,
-                                timeout=3, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        value = result.stdout.decode("utf-8", errors="strict").strip()
-        if result.returncode == 0 and value and len(value) <= 4096 and not any(ord(c) < 32 for c in value):
-            return value
-    except (OSError, subprocess.TimeoutExpired, UnicodeError):
-        pass
-    return None
-
-
 def _asset_url(asset, config):
     if not isinstance(asset, dict):
         raise UpdateError("업데이트 릴리스 자산 정보가 올바르지 않습니다.")
@@ -508,6 +492,9 @@ def update_and_select(bundle_root=None, cache_root=None, *, fetch=None, token=No
     """Verify, optionally update, and return {root, version, source, updated, warnings}.
 
     ``fetch(url, *, token, max_bytes, timeout) -> bytes`` can be injected for tests.
+    Public launches are anonymous, including after authentication or rate-limit
+    errors. Only an explicit internal caller may supply ``token``; never discover
+    credentials from the environment or the user's GitHub CLI login.
     No GUI, model process, credentials file, or user preference is launched/written.
     """
     bundle = Path(bundle_root or Path(__file__).resolve().parents[1]).absolute()
@@ -542,19 +529,8 @@ def update_and_select(bundle_root=None, cache_root=None, *, fetch=None, token=No
                 floor.extend(known_versions)
                 choices = cached + ([selected] if selected else [])
                 selected = max(choices, key=lambda item: _version(item["version"])) if choices else None
-                auth = token
-
                 def download(url, limit, timeout=NETWORK_TIMEOUT):
-                    nonlocal auth
-                    try:
-                        raw = fetch(url, token=auth, max_bytes=limit, timeout=timeout)
-                    except HTTPError as error:
-                        if auth or error.code not in (401, 403, 404):
-                            raise
-                        auth = _optional_token()
-                        if not auth:
-                            raise
-                        raw = fetch(url, token=auth, max_bytes=limit, timeout=timeout)
+                    raw = fetch(url, token=token, max_bytes=limit, timeout=timeout)
                     if not isinstance(raw, bytes) or len(raw) > limit:
                         raise UpdateError("업데이트 다운로드 크기가 제한을 초과합니다.")
                     return raw
@@ -580,6 +556,49 @@ def update_and_select(bundle_root=None, cache_root=None, *, fetch=None, token=No
             "updated": updated, "warnings": list(dict.fromkeys(warnings))}
 
 
+
+def _service_origin(value):
+    """Accept only a public HTTPS origin or a loopback HTTP origin."""
+    if not isinstance(value, str) or not value or len(value) > 2048:
+        return None
+    if any(ord(character) <= 32 or ord(character) == 127 for character in value) or "\\" in value:
+        return None
+    try:
+        url = urlsplit(value)
+        if (not url.hostname or url.username is not None or url.password is not None
+                or url.path not in ("", "/") or url.query or url.fragment
+                or url.scheme not in ("http", "https")
+                or (url.scheme == "http" and url.hostname.lower() not in ("localhost", "127.0.0.1", "::1", "::ffff:127.0.0.1"))):
+            return None
+        url.port  # Reject malformed ports before passing the origin to the GUI.
+        return url.scheme + "://" + url.netloc
+    except ValueError:
+        return None
+
+
+def _service_environment(bundle_root):
+    """Keep the download site's origin through a newer cached bootstrap/GUI."""
+    environment = os.environ.copy()
+    origin = _service_origin(environment.pop("RELAY_SERVICE_ORIGIN", None))
+    if origin is None:
+        try:
+            root = Path(bundle_root)
+            relative = "provider/service-config.json"
+            config = _config(_json(_read(root / "provider/update-config.json")))
+            manifest = _manifest(_json(_read(root / "provider-manifest.json")), config)
+            path, _ = _regular_file(root, relative)
+            raw = _read(path, 65536)
+            if hashlib.sha256(raw).hexdigest() == manifest["files"].get(relative):
+                service = _json(raw)
+                if isinstance(service, dict):
+                    origin = _service_origin(service.get("coordinator"))
+        except (OSError, UpdateError):
+            pass
+    if origin:
+        environment["RELAY_SERVICE_ORIGIN"] = origin
+    return environment
+
+
 def main(argv=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     check_only = "--check-only" in arguments
@@ -593,11 +612,12 @@ def main(argv=None):
             local = None
         own_root = Path(__file__).resolve().parents[1]
         selected_root = Path(local["root"]).resolve() if local else own_root
+        environment = _service_environment(own_root)
         if local and local["source"] == "cache" and selected_root != own_root:
             # A verified newer bootstrap takes over on the next launch. Its own
             # bundled root equals the selected cache, so this does not recurse.
             return subprocess.call([sys.executable, str(selected_root / "provider/update_launcher.py"),
-                                    *list(sys.argv[1:] if argv is None else argv)])
+                                    *list(sys.argv[1:] if argv is None else argv)], env=environment)
         result = update_and_select()
         for warning in result["warnings"]:
             print("Relay: " + warning, file=sys.stderr)
@@ -606,7 +626,7 @@ def main(argv=None):
         if check_only:
             print(json.dumps(result, ensure_ascii=True))
             return 0
-        return subprocess.call([sys.executable, str(Path(result["root"]) / "provider/setup_gui.py"), *arguments])
+        return subprocess.call([sys.executable, str(Path(result["root"]) / "provider/setup_gui.py"), *arguments], env=environment)
     except (OSError, UpdateError) as error:
         print("Relay: " + _failure_message(error), file=sys.stderr)
         return 1

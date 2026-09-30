@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "requestTimeoutMs": 600000,
+  "groups": [
+    {
+      "id": "qwen32-lan",
+      "model": "qwen3-32b",
+      "backend": "llama.cpp",
+      "splitMode": "layer",
+      "topology": "lan",
+      "endpoint": "http://127.0.0.1:8082",
+      "modelSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "templateSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "quantization": "Q4_K_M",
+      "engineVersion": "b10964",
+      "hourlyCost": 2,
+      "currency": "CR",
+      "contextTokens": 8192,
+      "slots": 1,
+      "modelArchitecture": {"layers": 64, "kvHeads": 8, "headDim": 128, "kvBytes": 2},
+      "gpus": [
+        {"id": "host-a/GPU-REPLACE-A", "layers": 32, "vramMiB": 16384, "weightsMiB": 10240, "workspaceMiB": 1024, "reserveMiB": 1024},
+        {"id": "host-b/GPU-REPLACE-B", "layers": 32, "vramMiB": 16384, "weightsMiB": 10240, "workspaceMiB": 1024, "reserveMiB": 1024}
+      ]
+    },
+    {
+      "id": "qwen32-standby",
+      "model": "qwen3-32b",
+      "backend": "llama.cpp",
+      "splitMode": "layer",
+      "topology": "lan",
+      "endpoint": "http://127.0.0.1:8083",
+      "modelSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "templateSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "quantization": "Q4_K_M",
+      "engineVersion": "b10964",
+      "hourlyCost": 2,
+      "currency": "CR",
+      "contextTokens": 8192,
+      "slots": 1,
+      "modelArchitecture": {"layers": 64, "kvHeads": 8, "headDim": 128, "kvBytes": 2},
+      "gpus": [
+        {"id": "host-c/GPU-REPLACE-C", "layers": 32, "vramMiB": 16384, "weightsMiB": 10240, "workspaceMiB": 1024, "reserveMiB": 1024},
+        {"id": "host-d/GPU-REPLACE-D", "layers": 32, "vramMiB": 16384, "weightsMiB": 10240, "workspaceMiB": 1024, "reserveMiB": 1024}
+      ]
+    }
+  ],
+  "tenants": [
+    {
+      "id": "alice",
+      "keySha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "models": ["qwen3-32b"],
+      "maxConcurrent": 1
+    }
+  ]
+}

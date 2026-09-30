@@ -1,6 +1,7 @@
 import {createHash} from "node:crypto";
 import {readFile} from "node:fs/promises";
 import {resolve} from "node:path";
+import {validatedPublicOrigin} from "./launch-auth.mjs";
 
 function crc32(data) {
   let crc = 0xffffffff;
@@ -47,6 +48,7 @@ export const PROVIDER_FILES = Object.freeze([
   "provider/update-config.json", "provider/version.json",
 ]);
 export const PROVIDER_MANIFEST = "provider-manifest.json";
+export const PROVIDER_SERVICE_CONFIG = "provider/service-config.json";
 const sha256 = data => createHash("sha256").update(data).digest("hex");
 const jsonBytes = value => Buffer.from(JSON.stringify(value, null, 2) + "\n", "utf8");
 
@@ -79,8 +81,15 @@ export function providerMetadata(config, version) {
     tag: config.release_tag_prefix + version.version};
 }
 
-export async function providerPackage(root) {
+export async function providerPackage(root, {coordinator} = {}) {
   const files = await Promise.all(PROVIDER_FILES.map(async name => ({name, data: await providerFileData(root, name)})));
+  // Site downloads carry only the server's validated public origin. Never read
+  // local connection/settings files or derive this value from request headers.
+  if (coordinator !== undefined) {
+    const origin = validatedPublicOrigin(coordinator);
+    if (!origin || typeof coordinator !== "string") throw new Error("Invalid provider service origin");
+    files.push({name: PROVIDER_SERVICE_CONFIG, data: jsonBytes({coordinator: origin})});
+  }
   const byName = new Map(files.map(file => [file.name, file.data]));
   const config = JSON.parse(byName.get("provider/update-config.json").toString("utf8"));
   const version = JSON.parse(byName.get("provider/version.json").toString("utf8"));
@@ -91,6 +100,6 @@ export async function providerPackage(root) {
   return {archive, manifest, releaseManifest, config};
 }
 
-export async function providerArchive(root) {
-  return (await providerPackage(root)).archive;
+export async function providerArchive(root, options) {
+  return (await providerPackage(root, options)).archive;
 }

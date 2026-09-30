@@ -42,6 +42,14 @@ def bare_worker(*, once=False):
 
 
 class ProviderAuditTests(unittest.TestCase):
+    def setUp(self):
+        # Keep the existing simulated-clock/scheduler-delay hooks for deadline
+        # audits; real completion wakeups are exercised by provider_transport_test.
+        wait = patch.object(provider.concurrent.futures, "wait",
+                            side_effect=lambda _futures, timeout: provider.time.sleep(timeout))
+        wait.start()
+        self.addCleanup(wait.stop)
+
     def test_lost_submit_response_retries_the_identical_result_payload(self):
         worker = bare_worker(once=True)
         task = {"taskId": "audit-task", "lease": {"attemptId": "audit-attempt", "epoch": 1}}
@@ -114,7 +122,7 @@ class ProviderAuditTests(unittest.TestCase):
                 worker.run()
         worker.stop_runtime.assert_called()
         self.assertEqual([call["action"] for call in calls], ["status", "poll", "poll", "poll", "release"])
-        self.assertEqual(calls[2]["payload"], {"attemptId": "audit-attempt", "epoch": 7})
+        self.assertEqual(calls[2]["payload"], {"capabilities": ["chat", "renter-model", "rental-session"], "attemptId": "audit-attempt", "epoch": 7})
         self.assertEqual(calls[4]["payload"], {"taskId": "audit-task", "attemptId": "audit-attempt", "epoch": 7})
     def test_idle_worker_recovers_after_coordinator_closes_without_response(self):
         """A transient peer close must not permanently end an otherwise live worker."""
@@ -240,7 +248,7 @@ class ProviderAuditTests(unittest.TestCase):
             with self.assertRaises(HTTPError):
                 worker.run()
         self.assertEqual([entry["action"] for entry in actions], ["status", "poll", "poll", "release"])
-        self.assertEqual(actions[2]["payload"], {"attemptId": "old-attempt", "epoch": 1})
+        self.assertEqual(actions[2]["payload"], {"capabilities": ["chat", "renter-model", "rental-session"], "attemptId": "old-attempt", "epoch": 1})
         executor.submit.assert_not_called()
         worker.stop_runtime.assert_called()
 
@@ -298,7 +306,8 @@ class ProviderAuditTests(unittest.TestCase):
         def sleep(seconds):
             if seconds == 1:
                 drains.append(seconds)
-                self.assertEqual(worker.start_runtime.call_count, 1)
+                # Runtime startup now belongs to the leased inference worker.
+                self.assertEqual(worker.start_runtime.call_count, 0)
                 self.assertEqual(actions, ["status", "poll", "poll", "poll", "release"])
                 if len(drains) == 2:
                     future.set_result({"raw": "discarded old result"})
@@ -375,7 +384,7 @@ class ProviderAuditTests(unittest.TestCase):
 
         try:
             with patch.object(worker, "_set_lease", side_effect=short_lease), \
-                    patch.object(worker, "_sleep", side_effect=lambda _: threading.Event().wait(0.01)), \
+                    patch.object(worker, "_sleep", side_effect=lambda *_: threading.Event().wait(0.01)), \
                     patch.object(provider.concurrent.futures, "ThreadPoolExecutor", return_value=executor):
                 with self.assertRaisesRegex(RuntimeError, "Lease renewal not confirmed"):
                     worker.run()

@@ -1,0 +1,14 @@
+**
+!package.json
+!standalone/
+!standalone/*.mjs
+!lib/
+!lib/relay/
+!lib/relay/*.mjs
+!standalone-dist/
+!standalone-dist/**
+!START-PROVIDER.cmd
+!provider/
+!provider/*.py
+!provider/update-config.json
+!provider/version.json

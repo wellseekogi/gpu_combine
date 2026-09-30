@@ -8,6 +8,9 @@ function Table({ className, ...props }: React.ComponentProps<"table">) {
   return (
     <div
       data-slot="table-container"
+      tabIndex={0}
+      role="region"
+      aria-label="가로로 스크롤할 수 있는 표"
       className="relative w-full overflow-x-auto"
     >
       <table

@@ -1,4 +1,5 @@
 provider/*.py text eol=lf
+public/*.py text eol=lf
 provider/*.json text eol=lf
 tests/*_test.py text eol=lf
 tests/provider-package.test.mjs text eol=lf

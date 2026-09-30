@@ -4,6 +4,12 @@ import {initialState,transition,assertInvariants,hash,fixture,view,available,LEA
 import {execute,getView} from "../lib/relay/service.mjs";
 import {DatabaseSync} from "node:sqlite";
 const start=1700000000000;
+test("native SHA-256 preserves token and JSON UTF-8 digests",async()=>{
+ for(const value of ["",undefined,null,3,"한글 😀","\ud800","a".repeat(90000)]){
+  const expected=Buffer.from(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(value))).toString("hex");
+  assert.equal(await hash(value),expected);
+ }
+});
 const model={name:"test-model",digest:"a".repeat(64),runtime:"b".repeat(64),template:"c".repeat(64),context:8192,minVram:4096};
 const doc={title:"한글 😀",text:"라이선스: MIT\n지원 GPU: CUDA",url:"https://example.org/spec"};
 const request=(docs=[doc],extra={})=>({title:"test",fields:["라이선스"],documents:docs,budget:100,minutes:30,publicData:true,modelId:"fixture-v1",...extra});
@@ -47,4 +53,29 @@ test("SQLite persistence recovers state after closing and reopening database",as
 
 test("earned contribution can fund a new job without creating credits",async()=>{const s=await demo([doc,doc,doc,doc]);await transition(s,"demo","tick",{},start);await transition(s,"demo","tick",{},start+7000);await transition(s,"demo","tick",{},start+14000);const node=s.books.demo.nodes.find(n=>n.earned>=18);assert.ok(node);const before=Object.values(s.books.demo.accounts).reduce((a,b)=>a+b,0);await transition(s,"demo","create",request([doc],{payer:node.account}),start+15000);await transition(s,"demo","tick",{},start+15001);await transition(s,"demo","tick",{},start+22002);assert.equal(s.books.demo.jobs[0].payer,node.account);assert.equal(s.books.demo.jobs[0].spent,10);assert.equal(Object.values(s.books.demo.accounts).reduce((a,b)=>a+b,0),before);assertInvariants(s)});
 
+test("linear ledger validation retains duplicate, missing, balance and slot fences", async () => {
+ const {s,n,payload}=await setup();await transition(s,"live","submit",payload,start+1,n.nodeId);
+ assertInvariants(s);
+ for(const corrupt of [
+  b=>b.ledger.push({...b.ledger.find(entry=>entry.type==="settlement")}),
+  b=>{b.ledger=b.ledger.filter(entry=>entry.type!=="settlement");},
+  b=>b.ledger.push({type:"settlement",taskId:"orphan"}),
+  b=>b.ledger.push({type:"allocation",taskId:payload.taskId}),
+  b=>{b.accounts.requester--;},
+  b=>b.jobs[0].tasks.push({...b.jobs[0].tasks[0]}),
+ ]){const state=structuredClone(s);corrupt(state.books.live);assert.throws(()=>assertInvariants(state),e=>e.status===500);}
+ const state=await demo([doc,doc]);await transition(state,"demo","tick",{},start);
+ state.books.demo.jobs[0].tasks[1].lease.nodeId=state.books.demo.jobs[0].tasks[0].lease.nodeId;
+ assert.throws(()=>assertInvariants(state),e=>e.status===500);
+});
 
+test("public snapshots exclude receipt storage and retain independent reservation balances", async () => {
+ const s=await demo([doc,doc]);s.books.demo.accounts.extra=50;s.books.demo.issued+=50;
+ s.books.demo.jobs[0].payer="extra";
+ s.receipts=[{private:"receipt-secret",result:{large:"x".repeat(50000)}}];
+ const result=view(s,start);
+ assert.equal(result.receipts,undefined);assert.equal(result.books.demo.accountAvailable.extra,30);
+ assert.equal(result.books.demo.reserved,0);assert.equal(result.books.demo.available,1000);
+ result.books.demo.jobs[0].documents[0].text="changed";
+ assert.equal(s.books.demo.jobs[0].documents[0].text,doc.text);
+});

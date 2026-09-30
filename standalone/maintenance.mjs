@@ -3,11 +3,28 @@ import {execute} from "../lib/relay/service.mjs";
 // A server-only timer. Provider polling still claims work; maintenance never runs
 // live inference or creates a lease for an absent provider.
 export function needsMaintenance(book, mode, now) {
-  return book.jobs.some(job => !job.archived && job.tasks.some(task => {
-    if (task.status !== "ready" && task.status !== "leased") return false;
-    if (mode === "demo") return true;
-    return job.deadline <= now || (task.status === "leased" && task.lease.expiresAt <= now);
-  }));
+  return nextMaintenanceAt(book, mode) <= now;
+}
+
+function nextMaintenanceAt(book, mode) {
+  let due = Infinity;
+  let nodes;
+  for (const job of book.jobs) {
+    if (mode === "live" && job.kind === "rental" && !job.cancelled && !["closed", "failed"].includes(job.rentalStage)) {
+      nodes ??= new Map(book.nodes.map(node => [node.id, node]));
+      const node = nodes.get(job.allowedNodes[0]);
+      if (!node || node.revoked || node.status !== "online") return -Infinity;
+      due = Math.min(due, node.lastSeen + 45000);
+    }
+    if (job.archived) continue;
+    for (const task of job.tasks) {
+      if (task.status !== "ready" && task.status !== "leased") continue;
+      if (mode === "demo") return -Infinity;
+      if (job.deadline < due) due = job.deadline;
+      if (task.status === "leased" && task.lease.expiresAt < due) due = task.lease.expiresAt;
+    }
+  }
+  return due;
 }
 
 export function createMaintenanceScheduler({
@@ -29,6 +46,8 @@ export function createMaintenanceScheduler({
   let timer = null;
   let started = false;
   let closed = false;
+  // Cache only revision and deadline, never a parsed state or credentials.
+  const checked = new Map();
 
   function report(error, poolId = null) {
     try { onError(error, {poolId}); } catch { /* Logging must not stop recovery. */ }
@@ -52,9 +71,17 @@ export function createMaintenanceScheduler({
       if (closed) break;
       try {
         const row = await store.read(poolId);
-        if (!row || closed) continue;
+        if (!row || closed) { checked.delete(poolId); continue; }
         result.pools++;
+        const prior = checked.get(poolId);
+        if (prior && prior.revision === row.revision && clock() < prior.due) continue;
         const state = JSON.parse(row.state);
+        const due = Math.min(nextMaintenanceAt(state.books.live, "live"), nextMaintenanceAt(state.books.demo, "demo"));
+        checked.delete(poolId);
+        if (Number.isSafeInteger(row.revision)) {
+          if (checked.size >= 64) checked.delete(checked.keys().next().value);
+          checked.set(poolId, {revision: row.revision, due});
+        }
         for (const mode of ["live", "demo"]) {
           if (closed) break;
           if (!needsMaintenance(state.books[mode], mode, clock())) continue;
@@ -102,6 +129,7 @@ export function createMaintenanceScheduler({
     if (timer !== null) clearTimeout(timer);
     timer = null;
     if (active) await active;
+    checked.clear();
   }
 
   return {start, stop, runOnce};

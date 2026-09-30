@@ -6,7 +6,7 @@ import {mkdtemp, mkdir, readFile, readdir, rm, unlink, writeFile} from "node:fs/
 import {tmpdir} from "node:os";
 import {dirname, join, resolve} from "node:path";
 import {promisify} from "node:util";
-import {PROVIDER_FILES, PROVIDER_MANIFEST, normalizeProviderFile, providerFileData,
+import {PROVIDER_FILES, PROVIDER_MANIFEST, PROVIDER_SERVICE_CONFIG, normalizeProviderFile, providerFileData,
   providerMetadata, providerPackage} from "../standalone/provider-archive.mjs";
 import {packageOptions} from "../scripts/package-provider.mjs";
 const root = resolve(import.meta.dirname, "..");
@@ -48,11 +48,11 @@ async function fixture(t, {crlf = false, bom = false} = {}) {
   return directory;
 }
 
-function verifyPackage(result) {
+function verifyPackage(result, optionalFiles = []) {
   const {archive, manifest, releaseManifest} = result;
   const entries = archiveEntries(archive);
-  assert.deepEqual([...entries.keys()], [...PROVIDER_FILES, PROVIDER_MANIFEST]);
-  assert.deepEqual(Object.keys(manifest.files), PROVIDER_FILES);
+  assert.deepEqual([...entries.keys()], [...PROVIDER_FILES, ...optionalFiles, PROVIDER_MANIFEST]);
+  assert.deepEqual(Object.keys(manifest.files), [...PROVIDER_FILES, ...optionalFiles]);
   assert.deepEqual(JSON.parse(entries.get(PROVIDER_MANIFEST)), manifest);
   assert.deepEqual(releaseManifest, {...manifest, archive: {name: "relay-provider.zip", sha256: hash(archive), size: archive.length}});
   for (const [name, expected] of Object.entries(manifest.files)) {
@@ -104,6 +104,22 @@ result = unittest.TextTestRunner(verbosity=2).run(suite)
 sys.exit(0 if result.wasSuccessful() and result.testsRun == 1 else 1)
 `, resolve(root, "tests/runtime_discovery_test.py"), resolve(directory, "provider/runtime_discovery.py")],
   {cwd: directory, windowsHide: true, timeout: 30_000});
+});
+
+test("site downloads pin a validated coordinator in the verified manifest without local settings", async t => {
+  const directory = await fixture(t);
+  await writeFile(resolve(directory, PROVIDER_SERVICE_CONFIG), JSON.stringify({coordinator: "https://wrong.example", token: "PRIVATE_TOKEN"}));
+  for (const coordinator of ["https://relay.example/", "http://127.0.0.1:8788"]) {
+    const result = await providerPackage(directory, {coordinator});
+    const entries = verifyPackage(result, [PROVIDER_SERVICE_CONFIG]);
+    assert.deepEqual(JSON.parse(entries.get(PROVIDER_SERVICE_CONFIG)), {coordinator: new URL(coordinator).origin});
+    assert.equal(result.archive.includes(Buffer.from("PRIVATE_TOKEN")), false);
+    assert.equal(result.archive.includes(Buffer.from("wrong.example")), false);
+  }
+  assert.equal(verifyPackage(await providerPackage(directory)).has(PROVIDER_SERVICE_CONFIG), false,
+    "generic GitHub releases remain independent of the site that created them");
+  for (const coordinator of [null, "", false, "http://remote.example", "https://user:secret@relay.example", "https://relay.example/path", "https://relay.example/?token=secret", "https://relay.example#fragment"])
+    await assert.rejects(providerPackage(directory, {coordinator}));
 });
 test("private connection data, preferences, models and runtime folders never enter the archive", async t => {
   const directory = await fixture(t);

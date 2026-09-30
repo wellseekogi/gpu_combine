@@ -1,0 +1,72 @@
+test_idle_worker_recovers_after_coordinator_closes_without_response (audit_provider_test.ProviderAuditTests.test_idle_worker_recovers_after_coordinator_closes_without_response)
+A transient peer close must not permanently end an otherwise live worker. ... ERROR
+Running assigned document audit-task
+Settled receipt: audit-receipt
+test_lost_submit_response_retries_the_identical_result_payload (audit_provider_test.ProviderAuditTests.test_lost_submit_response_retries_the_identical_result_payload) ... ok
+test_network_renewal_wait_cannot_keep_gpu_running_past_server_lease (audit_provider_test.ProviderAuditTests.test_network_renewal_wait_cannot_keep_gpu_running_past_server_lease)
+Running assigned document audit-task
+Provider recovery: TimeoutError
+A stalled renewal must reclaim GPU before the initial 30-second grant expires. ... FAIL
+Running assigned document audit-task
+Provider recovery: RuntimeError
+test_pause_during_renewal_reclaims_and_releases_the_original_attempt (audit_provider_test.ProviderAuditTests.test_pause_during_renewal_reclaims_and_releases_the_original_attempt) ... ok
+
+======================================================================
+ERROR: test_idle_worker_recovers_after_coordinator_closes_without_response (audit_provider_test.ProviderAuditTests.test_idle_worker_recovers_after_coordinator_closes_without_response)
+A transient peer close must not permanently end an otherwise live worker.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\gpu_togeter\tests\audit_provider_test.py", line 135, in test_idle_worker_recovers_after_coordinator_closes_without_response
+    worker.run()
+    ~~~~~~~~~~^^
+  File "C:\gpu_togeter\provider\provider.py", line 152, in run
+    status = self.api("status", {})
+  File "C:\gpu_togeter\provider\provider.py", line 46, in api
+    return request_json(self.args.coordinator.rstrip("/") + "/api/provider",
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                        {"poolId": self.args.pool, "nodeId": self.args.node, "action": action,
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                         "payload": payload}, self.token)["result"]
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\gpu_togeter\provider\provider.py", line 29, in request_json
+    with OPENER.open(req, timeout=timeout) as response:
+         ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python313\Lib\urllib\request.py", line 489, in open
+    response = self._open(req, data)
+  File "C:\Python313\Lib\urllib\request.py", line 506, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+                              '_open', req)
+  File "C:\Python313\Lib\urllib\request.py", line 466, in _call_chain
+    result = func(*args)
+  File "C:\Python313\Lib\urllib\request.py", line 1348, in http_open
+    return self.do_open(http.client.HTTPConnection, req)
+           ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Python313\Lib\urllib\request.py", line 1323, in do_open
+    r = h.getresponse()
+  File "C:\Python313\Lib\http\client.py", line 1430, in getresponse
+    response.begin()
+    ~~~~~~~~~~~~~~^^
+  File "C:\Python313\Lib\http\client.py", line 331, in begin
+    version, status, reason = self._read_status()
+                              ~~~~~~~~~~~~~~~~~^^
+  File "C:\Python313\Lib\http\client.py", line 300, in _read_status
+    raise RemoteDisconnected("Remote end closed connection without"
+                             " response")
+http.client.RemoteDisconnected: Remote end closed connection without response
+
+======================================================================
+FAIL: test_network_renewal_wait_cannot_keep_gpu_running_past_server_lease (audit_provider_test.ProviderAuditTests.test_network_renewal_wait_cannot_keep_gpu_running_past_server_lease)
+A stalled renewal must reclaim GPU before the initial 30-second grant expires.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\gpu_togeter\tests\audit_provider_test.py", line 178, in test_network_renewal_wait_cannot_keep_gpu_running_past_server_lease
+    self.assertLessEqual(stopped_at[0], 30,
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+                         "GPU reclaimed at %.1fs, after the server's 30s lease expired" % stopped_at[0])
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 36.0 not less than or equal to 30 : GPU reclaimed at 36.0s, after the server's 30s lease expired
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.569s
+
+FAILED (failures=1, errors=1)

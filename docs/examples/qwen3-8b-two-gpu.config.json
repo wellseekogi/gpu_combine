@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "requestTimeoutMs": 600000,
+  "groups": [
+    {
+      "id": "qwen8-two-gpu",
+      "model": "qwen3-8b-q8_0-two-gpu",
+      "backend": "llama.cpp",
+      "splitMode": "layer",
+      "topology": "lan",
+      "endpoint": "http://127.0.0.1:8082",
+      "modelSha256": "408b955510e196121c1c375201744783b5c9a43c7956d73fc78df54c66e883d6",
+      "templateSha256": "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361",
+      "quantization": "Q8_0",
+      "engineVersion": "b10964",
+      "hourlyCost": 0,
+      "currency": "CR",
+      "contextTokens": 2048,
+      "slots": 1,
+      "modelArchitecture": {
+        "layers": 36,
+        "kvHeads": 8,
+        "headDim": 128,
+        "kvBytes": 2
+      },
+      "gpus": [
+        {
+          "id": "laptop/rtx3050ti",
+          "layers": 15,
+          "vramMiB": 4096,
+          "weightsMiB": 2933,
+          "workspaceMiB": 384,
+          "reserveMiB": 512
+        },
+        {
+          "id": "desktop/gtx1660super",
+          "layers": 21,
+          "vramMiB": 6144,
+          "weightsMiB": 4737,
+          "workspaceMiB": 384,
+          "reserveMiB": 512
+        }
+      ]
+    }
+  ],
+  "tenants": []
+}
